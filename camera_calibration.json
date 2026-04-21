@@ -1,0 +1,61 @@
+{
+  "pattern_type": "chessboard",
+  "chessboard_inner_corners": [
+    15,
+    10
+  ],
+  "square_size_mm": 25.0,
+  "image_size": {
+    "width": 1280,
+    "height": 720
+  },
+  "rms": 0.2724695846286794,
+  "reprojection_error": 0.27246974355784687,
+  "camera_matrix": [
+    [
+      787.7611113418183,
+      0.0,
+      634.109890048723
+    ],
+    [
+      0.0,
+      788.9405193336817,
+      353.78930172769935
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "dist_coeffs": [
+    [
+      -0.38388502187437434,
+      0.18942104635075352,
+      0.0002585533360415095,
+      0.0001394879203564796,
+      -0.05269995844151917
+    ]
+  ],
+  "used_images": [
+    "images\\frame_000.jpg",
+    "images\\frame_001.jpg",
+    "images\\frame_002.jpg",
+    "images\\frame_003.jpg",
+    "images\\frame_005.jpg",
+    "images\\frame_006.jpg",
+    "images\\frame_007.jpg",
+    "images\\frame_008.jpg",
+    "images\\frame_009.jpg",
+    "images\\frame_010.jpg",
+    "images\\frame_011.jpg",
+    "images\\frame_012.jpg",
+    "images\\frame_015.jpg",
+    "images\\frame_017.jpg",
+    "images\\frame_018.jpg",
+    "images\\frame_019.jpg",
+    "images\\object_003.jpg",
+    "images\\object_007.jpg",
+    "images\\object_009.jpg"
+  ]
+}

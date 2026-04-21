@@ -1,0 +1,17 @@
+image_width: 1280
+image_height: 720
+camera_name: usb_camera
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [787.761111341818, 0.000000000000, 634.109890048723, 0.000000000000, 788.940519333682, 353.789301727699, 0.000000000000, 0.000000000000, 1.000000000000]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.383885021874, 0.189421046351, 0.000258553336, 0.000139487920, -0.052699958442]
+rms: 0.272469584629
+reprojection_error: 0.272469743558
+pattern_type: chessboard
+chessboard_inner_corners: [15, 10]
+square_size_mm: 25.000000
