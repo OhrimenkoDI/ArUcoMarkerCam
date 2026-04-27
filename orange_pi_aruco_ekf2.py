@@ -320,7 +320,9 @@ def connect_mavlink(connection_string: str):
 
 
 def send_rc_override(conn, channel: int, pwm: int) -> None:
-    values = [0] * 18
+    if not 1 <= channel <= 8:
+        raise ValueError(f"RC override supports channels 1..8 in this pymavlink build, got {channel}")
+    values = [0] * 8
     values[channel - 1] = pwm
     conn.mav.rc_channels_override_send(
         1,
