@@ -23,7 +23,7 @@ CHARUCO_MARKER_LENGTH_MM = 30.0
 
 # Used for standalone ArUco pose estimation.
 # If you print another physical size, update this constant.
-ARUCO_MARKER_LENGTH_MM = 180.0
+ARUCO_MARKER_LENGTH_MM = 168.0
 AXIS_LENGTH_MM = 50.0
 
 FPS_UPDATE_PERIOD_SEC = 0.5
