@@ -1,0 +1,38 @@
+ArduPilot settings for ArUco + Orange Pi 5 Ultra + EKF Source Set 2
+
+Set these parameters in ArduPilot:
+
+AHRS_EKF_TYPE = 3
+EK2_ENABLE = 0
+EK3_ENABLE = 1
+
+GPS_TYPE = 0
+EK3_GPS_CHECK = 0
+COMPASS_USE = 0
+COMPASS_USE2 = 0
+COMPASS_USE3 = 0
+
+EK3_SRC2_POSXY = 6
+EK3_SRC2_POSZ = 6
+EK3_SRC2_VELXY = 0
+EK3_SRC2_VELZ = 0
+EK3_SRC2_YAW = 6
+
+RC7_OPTION = 90
+
+If Orange Pi is connected to the flight controller over telemetry UART, set the serial port used by that link:
+SERIALx_PROTOCOL = 2
+SERIALx_BAUD = 921
+
+Notes:
+1. RC7_OPTION = 90 means channel 7 selects EKF source set.
+2. PWM about 1500 on channel 7 selects EKF Source Set 2.
+3. The script sends MAVLink ODOMETRY with position and yaw from ArUco markers.
+4. Disable compass only if you really fly indoor from external navigation.
+5. Replace SERIALx with the actual telemetry port on your controller, for example SERIAL1 or SERIAL2.
+
+Typical startup on Orange Pi 5 Ultra:
+python3 ArUcoMarkerCam/orange_pi_aruco_ekf2.py --camera-profile rys --calibration ArUcoMarkerCam/camera_calibration.json --layout ArUcoMarkerCam/marker_layout.json --mavlink /dev/ttyS3,921600
+
+If you use UDP instead of UART:
+python3 ArUcoMarkerCam/orange_pi_aruco_ekf2.py --camera-profile rys --mavlink udpout:127.0.0.1:14550
