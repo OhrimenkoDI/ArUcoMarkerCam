@@ -274,6 +274,22 @@ def rotation_matrix_to_quaternion_wxyz(rotation_matrix: np.ndarray) -> np.ndarra
     return (quat / norm).astype(np.float32)
 
 
+def rotation_matrix_to_euler_rpy(rotation_matrix: np.ndarray) -> np.ndarray:
+    sy = float(np.sqrt(rotation_matrix[0, 0] ** 2 + rotation_matrix[1, 0] ** 2))
+    singular = sy < 1e-6
+
+    if not singular:
+        roll = float(np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2]))
+        pitch = float(np.arctan2(-rotation_matrix[2, 0], sy))
+        yaw = float(np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]))
+    else:
+        roll = float(np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1]))
+        pitch = float(np.arctan2(-rotation_matrix[2, 0], sy))
+        yaw = 0.0
+
+    return np.array([roll, pitch, yaw], dtype=np.float32)
+
+
 def world_from_camera_to_frd(world_from_camera: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     position_cv_mm = world_from_camera[:3, 3]
     position_frd_m = (_CV_TO_FRD @ position_cv_mm) / 1000.0
@@ -333,30 +349,63 @@ def send_rc_override(conn, channel: int, pwm: int) -> None:
 
 def send_odometry(conn, timestamp_us: int, position_frd_m: np.ndarray, quaternion_wxyz: np.ndarray, quality: int) -> None:
     nan_value = float("nan")
-    conn.mav.odometry_send(
-        time_usec=timestamp_us,
-        frame_id=mavutil.mavlink.MAV_FRAME_LOCAL_FRD,
-        child_frame_id=mavutil.mavlink.MAV_FRAME_BODY_FRD,
-        x=float(position_frd_m[0]),
-        y=float(position_frd_m[1]),
-        z=float(position_frd_m[2]),
-        q=[
-            float(quaternion_wxyz[0]),
-            float(quaternion_wxyz[1]),
-            float(quaternion_wxyz[2]),
-            float(quaternion_wxyz[3]),
+    if hasattr(conn.mav, "odometry_send"):
+        conn.mav.odometry_send(
+            time_usec=timestamp_us,
+            frame_id=mavutil.mavlink.MAV_FRAME_LOCAL_FRD,
+            child_frame_id=mavutil.mavlink.MAV_FRAME_BODY_FRD,
+            x=float(position_frd_m[0]),
+            y=float(position_frd_m[1]),
+            z=float(position_frd_m[2]),
+            q=[
+                float(quaternion_wxyz[0]),
+                float(quaternion_wxyz[1]),
+                float(quaternion_wxyz[2]),
+                float(quaternion_wxyz[3]),
+            ],
+            vx=nan_value,
+            vy=nan_value,
+            vz=nan_value,
+            rollspeed=nan_value,
+            pitchspeed=nan_value,
+            yawspeed=nan_value,
+            pose_covariance=[0.0] * 21,
+            velocity_covariance=[0.0] * 21,
+            reset_counter=0,
+            estimator_type=mavutil.mavlink.MAV_ESTIMATOR_TYPE_VISION,
+            quality=int(quality),
+        )
+        return
+
+    rotation_matrix = np.array(
+        [
+            [
+                1.0 - 2.0 * (quaternion_wxyz[2] ** 2 + quaternion_wxyz[3] ** 2),
+                2.0 * (quaternion_wxyz[1] * quaternion_wxyz[2] - quaternion_wxyz[3] * quaternion_wxyz[0]),
+                2.0 * (quaternion_wxyz[1] * quaternion_wxyz[3] + quaternion_wxyz[2] * quaternion_wxyz[0]),
+            ],
+            [
+                2.0 * (quaternion_wxyz[1] * quaternion_wxyz[2] + quaternion_wxyz[3] * quaternion_wxyz[0]),
+                1.0 - 2.0 * (quaternion_wxyz[1] ** 2 + quaternion_wxyz[3] ** 2),
+                2.0 * (quaternion_wxyz[2] * quaternion_wxyz[3] - quaternion_wxyz[1] * quaternion_wxyz[0]),
+            ],
+            [
+                2.0 * (quaternion_wxyz[1] * quaternion_wxyz[3] - quaternion_wxyz[2] * quaternion_wxyz[0]),
+                2.0 * (quaternion_wxyz[2] * quaternion_wxyz[3] + quaternion_wxyz[1] * quaternion_wxyz[0]),
+                1.0 - 2.0 * (quaternion_wxyz[1] ** 2 + quaternion_wxyz[2] ** 2),
+            ],
         ],
-        vx=nan_value,
-        vy=nan_value,
-        vz=nan_value,
-        rollspeed=nan_value,
-        pitchspeed=nan_value,
-        yawspeed=nan_value,
-        pose_covariance=[0.0] * 21,
-        velocity_covariance=[0.0] * 21,
-        reset_counter=0,
-        estimator_type=mavutil.mavlink.MAV_ESTIMATOR_TYPE_VISION,
-        quality=int(quality),
+        dtype=np.float64,
+    )
+    roll, pitch, yaw = rotation_matrix_to_euler_rpy(rotation_matrix)
+    conn.mav.vision_position_estimate_send(
+        timestamp_us,
+        float(position_frd_m[0]),
+        float(position_frd_m[1]),
+        float(position_frd_m[2]),
+        float(roll),
+        float(pitch),
+        float(yaw),
     )
 
 
