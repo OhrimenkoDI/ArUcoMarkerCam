@@ -4,11 +4,13 @@ import time
 
 from pymavlink import mavutil
 
+from aruco_pose import ArucoPoseTracker
+
 # ── Выбор интерфейса ──────────────────────────────────────────────────────────
 # Установи одну из констант в True, вторую в False
 
-USE_UDP  = True    # UDP: подключение через MAVProxy (--out=udpin:0.0.0.0:14552)
-USE_UART = False   # UART: прямое подключение к полётному контроллеру по COM-порту
+USE_UDP  = False    # UDP: подключение через MAVProxy (--out=udpin:0.0.0.0:14552)
+USE_UART = True   # UART: прямое подключение к полётному контроллеру по COM-порту
 
 # ── Настройки UDP ─────────────────────────────────────────────────────────────
 UDP_IP   = "127.0.0.1"   #"10.0.20.15"
@@ -31,7 +33,7 @@ PWM_CH7 = 1500
 INTERVAL = 0.02  # 50 Hz — держит override активным (RC_OVERRIDE_TIME = 3 сек)
 
 # ── Внешний азимут (вместо компаса) ──────────────────────────────────────────
-AZIMUTH_DEG = 10  # градусы, потом сделаю переменным
+AZIMUTH_DEG = 10  # резервное значение, если маркеры не видны
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -107,24 +109,41 @@ def send_gps_origin(conn, lat_deg: float, lon_deg: float, alt_m: float = 0.0) ->
 
 def main() -> None:
     conn = make_connection()
-    print(f"RC_OVERRIDE  CH6={PWM_CH6}  CH7={PWM_CH7}  AZIMUTH={AZIMUTH_DEG}°")
+    print(f"RC_OVERRIDE  CH6={PWM_CH6}  CH7={PWM_CH7}  AZIMUTH={AZIMUTH_DEG}° (резерв)")
     print("Ctrl+C — остановить и отпустить каналы")
-
 
     # Задаём origin — реальные координаты твоей точки старта
     send_gps_origin(conn, lat_deg=60.00, lon_deg=30.0, alt_m=150.0)
     print("GPS origin установлен")
 
-
-    sent = 0
+    tracker = None
     try:
+        tracker = ArucoPoseTracker()
+        print("ArUco трекер запущен")
+
+        sent = 0
+        last_pose = None  # последняя известная поза, если маркеры временно не видны
         while True:
+            t0 = time.perf_counter()
+
+            pose = tracker.get_pose()
+            if pose is not None:
+                last_pose = pose
+            if last_pose is not None:
+                x_m, y_m, z_m, yaw_deg = last_pose
+            else:
+                x_m, y_m, z_m, yaw_deg = 0.0, 0.0, 0.0, float(AZIMUTH_DEG)
+
             #send_override(conn, PWM_CH6, PWM_CH7)
-            send_heading(conn, AZIMUTH_DEG)
+            send_heading(conn, yaw_deg, x_m, y_m, z_m)
             sent += 1
-            if sent % 50 == 0:
-                print(f"  sent={sent}  CH6={PWM_CH6}  CH7={PWM_CH7}  az={AZIMUTH_DEG}°")
-            time.sleep(INTERVAL)
+            if sent % 5 == 0:
+                src = "aruco" if last_pose is not None else "резерв"
+                print(f"  sent={sent}  [{src}]  x={x_m:.3f}m  y={y_m:.3f}m  z={z_m:.3f}m  az={yaw_deg:.1f}°")
+
+            remaining = INTERVAL - (time.perf_counter() - t0)
+            if remaining > 0:
+                time.sleep(remaining)
 
     except KeyboardInterrupt:
         print("\nОтпускаю каналы...")
@@ -133,6 +152,8 @@ def main() -> None:
             time.sleep(INTERVAL)
 
     finally:
+        if tracker is not None:
+            tracker.close()
         conn.close()
         print("Закрыто.")
 
