@@ -19,6 +19,7 @@ TARGET_WIDTH = int(os.environ.get("ARUCO_CAMERA_WIDTH", "1280"))
 TARGET_HEIGHT = int(os.environ.get("ARUCO_CAMERA_HEIGHT", "720"))
 TARGET_FPS = int(os.environ.get("ARUCO_CAMERA_FPS", "30"))
 TARGET_FOURCC = os.environ.get("ARUCO_CAMERA_FOURCC", "MJPG")
+LINUX_FALLBACK_SOURCES = ("/dev/video1", "/dev/video4", "/dev/video0")
 
 _BACKEND_MAP = {
     "auto": cv2.CAP_ANY,
@@ -87,6 +88,16 @@ def _normalize_camera_source(source):
     return source_text
 
 
+def _build_gstreamer_pipeline(source) -> Optional[str]:
+    if not isinstance(source, str) or not source.startswith("/dev/video"):
+        return None
+    return (
+        f"v4l2src device={source} io-mode=2 ! "
+        f"image/jpeg,width={TARGET_WIDTH},height={TARGET_HEIGHT},framerate={TARGET_FPS}/1 ! "
+        "jpegdec ! videoconvert ! appsink drop=true max-buffers=1 sync=false"
+    )
+
+
 def _camera_attempts(source):
     normalized_source = _normalize_camera_source(source)
     if CAMERA_BACKEND != "auto":
@@ -100,9 +111,18 @@ def _camera_attempts(source):
         ]
 
     attempts = []
-    if isinstance(normalized_source, str) and normalized_source.startswith("/dev/video"):
-        attempts.append((normalized_source, cv2.CAP_V4L2))
-    attempts.append((normalized_source, cv2.CAP_ANY))
+    linux_sources = [normalized_source]
+    if normalized_source == 0:
+        for fallback_source in LINUX_FALLBACK_SOURCES:
+            if fallback_source not in linux_sources:
+                linux_sources.append(fallback_source)
+
+    for linux_source in linux_sources:
+        pipeline = _build_gstreamer_pipeline(linux_source)
+        if pipeline is not None:
+            attempts.append((pipeline, getattr(cv2, "CAP_GSTREAMER", cv2.CAP_ANY)))
+            attempts.append((linux_source, cv2.CAP_V4L2))
+        attempts.append((linux_source, cv2.CAP_ANY))
     return attempts
 
 
