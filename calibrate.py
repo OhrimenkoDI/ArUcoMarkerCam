@@ -10,7 +10,7 @@ IMAGE_GLOB = "*.jpg"
 # Current photos contain a classic chessboard with 15x10 inner corners.
 PATTERN_TYPE = "chessboard"
 CHESSBOARD_INNER_CORNERS = (15, 10)
-SQUARE_SIZE_MM = 25.0
+SQUARE_SIZE_MM = 50.0
 
 SHOW_DETECTIONS = False
 SAVE_DEBUG_OVERLAYS = True

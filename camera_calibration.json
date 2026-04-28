@@ -4,23 +4,23 @@
     15,
     10
   ],
-  "square_size_mm": 25.0,
+  "square_size_mm": 50.0,
   "image_size": {
     "width": 1280,
     "height": 720
   },
-  "rms": 0.2724695846286794,
-  "reprojection_error": 0.27246974355784687,
+  "rms": 0.45776374263618386,
+  "reprojection_error": 0.4577637041139201,
   "camera_matrix": [
     [
-      787.7611113418183,
+      678.0017699741052,
       0.0,
-      634.109890048723
+      640.6334741251226
     ],
     [
       0.0,
-      788.9405193336817,
-      353.78930172769935
+      679.029134596658,
+      378.85654498408053
     ],
     [
       0.0,
@@ -30,11 +30,11 @@
   ],
   "dist_coeffs": [
     [
-      -0.38388502187437434,
-      0.18942104635075352,
-      0.0002585533360415095,
-      0.0001394879203564796,
-      -0.05269995844151917
+      0.06662865437384466,
+      -0.08434415112036191,
+      -0.00012529746835614146,
+      0.0005251928061625506,
+      -0.03483403937984791
     ]
   ],
   "used_images": [
@@ -42,6 +42,7 @@
     "images\\frame_001.jpg",
     "images\\frame_002.jpg",
     "images\\frame_003.jpg",
+    "images\\frame_004.jpg",
     "images\\frame_005.jpg",
     "images\\frame_006.jpg",
     "images\\frame_007.jpg",
@@ -50,12 +51,11 @@
     "images\\frame_010.jpg",
     "images\\frame_011.jpg",
     "images\\frame_012.jpg",
+    "images\\frame_013.jpg",
+    "images\\frame_014.jpg",
     "images\\frame_015.jpg",
+    "images\\frame_016.jpg",
     "images\\frame_017.jpg",
-    "images\\frame_018.jpg",
-    "images\\frame_019.jpg",
-    "images\\object_003.jpg",
-    "images\\object_007.jpg",
-    "images\\object_009.jpg"
+    "images\\frame_018.jpg"
   ]
 }
