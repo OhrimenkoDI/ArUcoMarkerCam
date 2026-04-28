@@ -22,6 +22,9 @@ DICTIONARY_NAME = "DICT_APRILTAG_36h11"
 ARUCO_MARKER_LENGTH_MM = 168.0
 AXIS_LENGTH_MM = 60.0
 BASE_MARKER_ID = 0
+LEARNING_MODE_3D = 1
+LEARNING_MODE_PLANAR = 2
+VERIFICATION_MODE = 3
 
 FPS_UPDATE_PERIOD_SEC = 0.5
 TEXT_COLOR = (0, 255, 0)
@@ -150,29 +153,112 @@ def rotation_matrix_to_euler_deg(rotation_matrix):
     return np.degrees([roll, pitch, yaw])
 
 
+def rotation_matrix_to_quaternion(rotation_matrix):
+    matrix = np.asarray(rotation_matrix, dtype=np.float64)
+    trace = np.trace(matrix)
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (matrix[2, 1] - matrix[1, 2]) / s
+        y = (matrix[0, 2] - matrix[2, 0]) / s
+        z = (matrix[1, 0] - matrix[0, 1]) / s
+    elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        s = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+        w = (matrix[2, 1] - matrix[1, 2]) / s
+        x = 0.25 * s
+        y = (matrix[0, 1] + matrix[1, 0]) / s
+        z = (matrix[0, 2] + matrix[2, 0]) / s
+    elif matrix[1, 1] > matrix[2, 2]:
+        s = np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+        w = (matrix[0, 2] - matrix[2, 0]) / s
+        x = (matrix[0, 1] + matrix[1, 0]) / s
+        y = 0.25 * s
+        z = (matrix[1, 2] + matrix[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+        w = (matrix[1, 0] - matrix[0, 1]) / s
+        x = (matrix[0, 2] + matrix[2, 0]) / s
+        y = (matrix[1, 2] + matrix[2, 1]) / s
+        z = 0.25 * s
+    quat = np.array([w, x, y, z], dtype=np.float64)
+    return quat / np.linalg.norm(quat)
+
+
+def quaternion_to_rotation_matrix(quaternion):
+    w, x, y, z = np.asarray(quaternion, dtype=np.float64)
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
 def average_transforms(transforms):
     if not transforms:
         return None
 
     translations = np.array([transform[:3, 3] for transform in transforms], dtype=np.float64)
-    rotvecs = []
+    quaternions = []
+    reference_quaternion = None
     for transform in transforms:
-        rvec, _ = cv2.Rodrigues(transform[:3, :3])
-        rotvecs.append(rvec.reshape(3))
+        quaternion = rotation_matrix_to_quaternion(transform[:3, :3])
+        if reference_quaternion is None:
+            reference_quaternion = quaternion
+        elif np.dot(quaternion, reference_quaternion) < 0.0:
+            quaternion = -quaternion
+        quaternions.append(quaternion)
 
     mean_transform = np.eye(4, dtype=np.float64)
     mean_transform[:3, 3] = np.mean(translations, axis=0)
-    mean_rvec = np.mean(np.array(rotvecs, dtype=np.float64), axis=0).reshape(3, 1)
-    mean_transform[:3, :3], _ = cv2.Rodrigues(mean_rvec)
+    mean_quaternion = np.mean(np.array(quaternions, dtype=np.float64), axis=0)
+    mean_quaternion /= np.linalg.norm(mean_quaternion)
+    mean_transform[:3, :3] = quaternion_to_rotation_matrix(mean_quaternion)
     return mean_transform
 
 
-def compute_pose_consistency_mm(candidates):
-    """Std-dev of camera positions across independent marker estimates — lower = better map."""
+def blend_transforms(old_transform, new_transform, alpha):
+    t = (1.0 - alpha) * old_transform[:3, 3] + alpha * new_transform[:3, 3]
+    q1 = rotation_matrix_to_quaternion(old_transform[:3, :3])
+    q2 = rotation_matrix_to_quaternion(new_transform[:3, :3])
+    if np.dot(q1, q2) < 0.0:
+        q2 = -q2
+    dot = float(np.clip(np.dot(q1, q2), -1.0, 1.0))
+    if dot > 0.9995:
+        q = q1 + alpha * (q2 - q1)
+    else:
+        theta = np.arccos(dot)
+        q = (np.sin((1.0 - alpha) * theta) * q1 + np.sin(alpha * theta) * q2) / np.sin(theta)
+    q /= np.linalg.norm(q)
+    result = np.eye(4, dtype=np.float64)
+    result[:3, 3] = t
+    result[:3, :3] = quaternion_to_rotation_matrix(q)
+    return result
+
+
+def compute_pose_consistency(candidates):
     if len(candidates) < 2:
-        return None
+        return None, None
     positions = np.array([t[:3, 3] for t in candidates], dtype=np.float64)
-    return float(np.mean(np.std(positions, axis=0)))
+    trans_mm = float(np.mean(np.std(positions, axis=0)))
+    quaternions = []
+    ref_q = None
+    for t in candidates:
+        q = rotation_matrix_to_quaternion(t[:3, :3])
+        if ref_q is None:
+            ref_q = q
+        elif np.dot(q, ref_q) < 0.0:
+            q = -q
+        quaternions.append(q)
+    mean_q = np.mean(quaternions, axis=0)
+    mean_q /= np.linalg.norm(mean_q)
+    rot_deg = float(np.mean([
+        np.degrees(2.0 * np.arccos(min(1.0, abs(float(np.dot(q, mean_q))))))
+        for q in quaternions
+    ]))
+    return trans_mm, rot_deg
 
 
 def update_error_ema(ema_dict, marker_id, new_error):
@@ -186,18 +272,21 @@ def parse_mode_arg():
     for arg in sys.argv[1:]:
         value = arg.strip().lower()
         if value in {"mode=1", "1", "--mode=1"}:
-            return 1
+            return LEARNING_MODE_3D
         if value in {"mode=2", "2", "--mode=2"}:
-            return 2
+            return LEARNING_MODE_PLANAR
+        if value in {"mode=3", "3", "--mode=3"}:
+            return VERIFICATION_MODE
     return None
 
 
 def select_mode_by_key():
-    canvas = np.full((360, 900, 3), 30, dtype=np.uint8)
+    canvas = np.full((420, 980, 3), 30, dtype=np.uint8)
     lines = [
         "Select mode",
-        "Press 1  - learning mode",
-        "Press 2  - localization mode",
+        "Press 1  - learning mode (3D map)",
+        "Press 2  - learning mode (planar floor map)",
+        "Press 3  - verification mode",
         f"Base marker id: {BASE_MARKER_ID}",
         "Esc - exit",
     ]
@@ -220,10 +309,13 @@ def select_mode_by_key():
         key = cv2.waitKey(0) & 0xFF
         if key == ord("1"):
             cv2.destroyWindow(SELECTION_WINDOW_TITLE)
-            return 1
+            return LEARNING_MODE_3D
         if key == ord("2"):
             cv2.destroyWindow(SELECTION_WINDOW_TITLE)
-            return 2
+            return LEARNING_MODE_PLANAR
+        if key == ord("3"):
+            cv2.destroyWindow(SELECTION_WINDOW_TITLE)
+            return VERIFICATION_MODE
         if key == 27:
             cv2.destroyWindow(SELECTION_WINDOW_TITLE)
             return None
@@ -276,7 +368,25 @@ def load_marker_layout():
     return payload, marker_transforms, marker_counts
 
 
-def normalize_marker_world_estimates(marker_world_estimates):
+def planarize_transform(transform):
+    planar = np.array(transform, dtype=np.float64, copy=True)
+    planar[:3, 3][2] = 0.0
+    yaw_deg = float(rotation_matrix_to_euler_deg(planar[:3, :3])[2])
+    yaw_rad = np.radians(yaw_deg)
+    cos_yaw = float(np.cos(yaw_rad))
+    sin_yaw = float(np.sin(yaw_rad))
+    planar[:3, :3] = np.array(
+        [
+            [cos_yaw, -sin_yaw, 0.0],
+            [sin_yaw, cos_yaw, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return planar
+
+
+def normalize_marker_world_estimates(marker_world_estimates, planar=False):
     if BASE_MARKER_ID not in marker_world_estimates:
         raise RuntimeError(f"Base marker {BASE_MARKER_ID} is missing from learned map.")
 
@@ -286,6 +396,8 @@ def normalize_marker_world_estimates(marker_world_estimates):
     normalized = {}
     for marker_id, marker_data in marker_world_estimates.items():
         normalized_transform = normalization_transform @ marker_data["transform"]
+        if planar:
+            normalized_transform = planarize_transform(normalized_transform)
         normalized[marker_id] = {
             "transform": normalized_transform,
             "count": marker_data["count"],
@@ -295,8 +407,8 @@ def normalize_marker_world_estimates(marker_world_estimates):
     return normalized
 
 
-def save_marker_layout(marker_world_estimates):
-    normalized_estimates = normalize_marker_world_estimates(marker_world_estimates)
+def save_marker_layout(marker_world_estimates, planar=False):
+    normalized_estimates = normalize_marker_world_estimates(marker_world_estimates, planar=planar)
     markers_payload = {}
     for marker_id in sorted(normalized_estimates):
         transform = normalized_estimates[marker_id]["transform"]
@@ -313,12 +425,13 @@ def save_marker_layout(marker_world_estimates):
         "base_marker_id": BASE_MARKER_ID,
         "marker_length_mm": ARUCO_MARKER_LENGTH_MM,
         "dictionary_name": DICTIONARY_NAME,
+        "layout_mode": "planar" if planar else "3d",
         "markers": markers_payload,
     }
     MARKER_LAYOUT_JSON_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def update_marker_world_estimates(marker_world_estimates, detected_poses):
+def update_marker_world_estimates(marker_world_estimates, detected_poses, planar=False):
     world_from_camera_candidates = []
     for marker_id, pose in detected_poses.items():
         if marker_id not in marker_world_estimates:
@@ -329,20 +442,42 @@ def update_marker_world_estimates(marker_world_estimates, detected_poses):
         )
 
     if not world_from_camera_candidates:
-        return None, [], None
+        return None, [], (None, None)
 
-    consistency_mm = compute_pose_consistency_mm(world_from_camera_candidates)
+    trans_mm, rot_deg = compute_pose_consistency(world_from_camera_candidates)
     world_from_camera = average_transforms(world_from_camera_candidates)
+    if planar and world_from_camera is not None:
+        world_from_camera = planarize_transform(world_from_camera)
+
+    # For map updates use world_from_camera derived only from the base marker —
+    # avoids circular bias where a wrong non-base marker poisons its own correction.
+    world_from_camera_trusted = None
+    if BASE_MARKER_ID in detected_poses and BASE_MARKER_ID in marker_world_estimates:
+        base_pose = detected_poses[BASE_MARKER_ID]
+        world_from_camera_trusted = (
+            marker_world_estimates[BASE_MARKER_ID]["transform"]
+            @ invert_transform(base_pose["camera_from_marker"])
+        )
+        if planar:
+            world_from_camera_trusted = planarize_transform(world_from_camera_trusted)
+    if world_from_camera_trusted is None:
+        world_from_camera_trusted = world_from_camera
+
     new_marker_ids = []
     for marker_id, pose in detected_poses.items():
-        estimated_world_from_marker = world_from_camera @ pose["camera_from_marker"]
+        estimated_world_from_marker = world_from_camera_trusted @ pose["camera_from_marker"]
+        if planar:
+            estimated_world_from_marker = planarize_transform(estimated_world_from_marker)
         if marker_id in marker_world_estimates:
             count = marker_world_estimates[marker_id]["count"]
-            old_transform = marker_world_estimates[marker_id]["transform"]
-            marker_world_estimates[marker_id]["transform"] = average_transforms(
-                [old_transform] * count + [estimated_world_from_marker]
-            )
             marker_world_estimates[marker_id]["count"] = count + 1
+            if marker_id != BASE_MARKER_ID:
+                old_transform = marker_world_estimates[marker_id]["transform"]
+                alpha = max(0.02, 1.0 / (count + 1))
+                updated = blend_transforms(old_transform, estimated_world_from_marker, alpha)
+                if planar:
+                    updated = planarize_transform(updated)
+                marker_world_estimates[marker_id]["transform"] = updated
         else:
             marker_world_estimates[marker_id] = {
                 "transform": estimated_world_from_marker,
@@ -350,26 +485,30 @@ def update_marker_world_estimates(marker_world_estimates, detected_poses):
             }
             new_marker_ids.append(marker_id)
 
-    return world_from_camera, new_marker_ids, consistency_mm
+    return world_from_camera, new_marker_ids, (trans_mm, rot_deg)
 
 
-def estimate_world_from_camera(marker_world_transforms, detected_poses):
+def estimate_world_from_camera(marker_world_transforms, detected_poses, planar=False):
     world_from_camera_candidates = []
     used_marker_ids = []
     for marker_id, pose in detected_poses.items():
         if marker_id not in marker_world_transforms:
             continue
         world_from_marker = marker_world_transforms[marker_id]
-        world_from_camera_candidates.append(
-            world_from_marker @ invert_transform(pose["camera_from_marker"])
-        )
+        candidate = world_from_marker @ invert_transform(pose["camera_from_marker"])
+        if planar:
+            candidate = planarize_transform(candidate)
+        world_from_camera_candidates.append(candidate)
         used_marker_ids.append(marker_id)
 
     if not world_from_camera_candidates:
-        return None, [], None
+        return None, [], (None, None)
 
-    consistency_mm = compute_pose_consistency_mm(world_from_camera_candidates)
-    return average_transforms(world_from_camera_candidates), used_marker_ids, consistency_mm
+    trans_mm, rot_deg = compute_pose_consistency(world_from_camera_candidates)
+    world_from_camera = average_transforms(world_from_camera_candidates)
+    if planar and world_from_camera is not None:
+        world_from_camera = planarize_transform(world_from_camera)
+    return world_from_camera, used_marker_ids, (trans_mm, rot_deg)
 
 
 def draw_marker_visuals(
@@ -457,23 +596,23 @@ def draw_world_pose_text(frame, title, world_from_camera, x, y, color):
     draw_multiline_text(frame, lines, x, y, color)
 
 
-def draw_quality_score(frame, quality_ema, x, y):
-    if quality_ema is None:
+def draw_quality_score(frame, trans_ema, rot_ema, x, y):
+    if trans_ema is None:
         label = "Map quality: --- (need 2+ markers)"
         color = INFO_COLOR
-    elif quality_ema < 5.0:
-        label = f"Map quality: {quality_ema:.1f} mm  GOOD"
+    elif trans_ema < 5.0 and rot_ema < 0.5:
+        label = f"Map quality: {trans_ema:.1f} mm  {rot_ema:.2f} deg  GOOD"
         color = QUALITY_GOOD_COLOR
-    elif quality_ema < 20.0:
-        label = f"Map quality: {quality_ema:.1f} mm  OK"
+    elif trans_ema < 20.0 and rot_ema < 2.0:
+        label = f"Map quality: {trans_ema:.1f} mm  {rot_ema:.2f} deg  OK"
         color = QUALITY_MED_COLOR
     else:
-        label = f"Map quality: {quality_ema:.1f} mm  POOR"
+        label = f"Map quality: {trans_ema:.1f} mm  {rot_ema:.2f} deg  POOR"
         color = QUALITY_BAD_COLOR
     cv2.putText(frame, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA)
 
 
-def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs):
+def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs, planar=False):
     marker_world_estimates = {
         BASE_MARKER_ID: {
             "transform": np.eye(4, dtype=np.float64),
@@ -481,8 +620,10 @@ def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs):
         }
     }
     marker_error_ema = {}
-    quality_ema = None
+    quality_trans_ema = None
+    quality_rot_ema = None
     last_status = "Show marker 0 together with other markers."
+    mode_name = "learning (planar)" if planar else "learning (3D)"
     current_fps = 0.0
     fps_frame_count = 0
     fps_started_at = time.perf_counter()
@@ -518,16 +659,19 @@ def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs):
             camera_matrix, dist_coeffs, marker_counts, marker_error_ema,
         )
 
-        world_from_camera, new_marker_ids, consistency_mm = update_marker_world_estimates(
+        world_from_camera, new_marker_ids, (trans_mm, rot_deg) = update_marker_world_estimates(
             marker_world_estimates,
             detected_poses,
+            planar=planar,
         )
 
-        if consistency_mm is not None:
-            if quality_ema is None:
-                quality_ema = consistency_mm
+        if trans_mm is not None:
+            if quality_trans_ema is None:
+                quality_trans_ema = trans_mm
+                quality_rot_ema = rot_deg
             else:
-                quality_ema = EMA_ALPHA * consistency_mm + (1.0 - EMA_ALPHA) * quality_ema
+                quality_trans_ema = EMA_ALPHA * trans_mm + (1.0 - EMA_ALPHA) * quality_trans_ema
+                quality_rot_ema = EMA_ALPHA * rot_deg + (1.0 - EMA_ALPHA) * quality_rot_ema
 
         if new_marker_ids:
             last_status = f"Learned markers: {', '.join(str(v) for v in sorted(new_marker_ids))}"
@@ -544,14 +688,15 @@ def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs):
                 INFO_COLOR,
             )
 
-        draw_quality_score(frame, quality_ema, 10, 360)
+        draw_quality_score(frame, quality_trans_ema, quality_rot_ema, 10, 360)
 
         draw_multiline_text(
             frame,
             [
-                "Mode 1: learning",
+                f"Mode: {mode_name}",
                 f"Known markers: {', '.join(str(v) for v in sorted(marker_world_estimates))}",
                 f"Status: {last_status}",
+                "Planar floor constraints: ON" if planar else "Planar floor constraints: OFF",
                 "S - save marker_layout.json",
                 "ESC - exit",
             ],
@@ -573,21 +718,24 @@ def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs):
         cv2.imshow(WINDOW_TITLE, frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("s"):
-            save_marker_layout(marker_world_estimates)
+            save_marker_layout(marker_world_estimates, planar=planar)
             last_status = f"Saved {len(marker_world_estimates)} markers to {MARKER_LAYOUT_JSON_PATH.name}"
             print(last_status)
         if key == 27:
             break
 
 
-def run_localization_mode(cap, dictionary, camera_matrix, dist_coeffs):
+def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
     layout_payload, marker_world_transforms, marker_counts = load_marker_layout()
     marker_error_ema = {}
-    quality_ema = None
+    quality_trans_ema = None
+    quality_rot_ema = None
     current_fps = 0.0
     fps_frame_count = 0
     fps_started_at = time.perf_counter()
     last_status = f"Loaded {len(marker_world_transforms)} markers from {MARKER_LAYOUT_JSON_PATH.name}"
+    layout_mode = layout_payload.get("layout_mode", "3d")
+    planar = layout_mode == "planar"
     print(last_status)
 
     while True:
@@ -619,16 +767,19 @@ def run_localization_mode(cap, dictionary, camera_matrix, dist_coeffs):
             camera_matrix, dist_coeffs, marker_counts, marker_error_ema,
         )
 
-        world_from_camera, used_marker_ids, consistency_mm = estimate_world_from_camera(
+        world_from_camera, used_marker_ids, (trans_mm, rot_deg) = estimate_world_from_camera(
             marker_world_transforms,
             detected_poses,
+            planar=planar,
         )
 
-        if consistency_mm is not None:
-            if quality_ema is None:
-                quality_ema = consistency_mm
+        if trans_mm is not None:
+            if quality_trans_ema is None:
+                quality_trans_ema = trans_mm
+                quality_rot_ema = rot_deg
             else:
-                quality_ema = EMA_ALPHA * consistency_mm + (1.0 - EMA_ALPHA) * quality_ema
+                quality_trans_ema = EMA_ALPHA * trans_mm + (1.0 - EMA_ALPHA) * quality_trans_ema
+                quality_rot_ema = EMA_ALPHA * rot_deg + (1.0 - EMA_ALPHA) * quality_rot_ema
 
         if world_from_camera is not None:
             last_status = f"Using markers: {', '.join(str(v) for v in sorted(set(used_marker_ids)))}"
@@ -643,15 +794,16 @@ def run_localization_mode(cap, dictionary, camera_matrix, dist_coeffs):
         else:
             last_status = "No known map markers in view."
 
-        draw_quality_score(frame, quality_ema, 10, 360)
+        draw_quality_score(frame, quality_trans_ema, quality_rot_ema, 10, 360)
 
         draw_multiline_text(
             frame,
             [
-                "Mode 2: localization",
+                "Mode 3: verification",
                 f"Map markers: {', '.join(str(v) for v in sorted(marker_world_transforms))}",
                 f"Status: {last_status}",
                 f"Base marker: {layout_payload['base_marker_id']}",
+                f"Layout mode: {layout_mode}",
                 "ESC - exit",
             ],
             10,
@@ -688,13 +840,15 @@ def main():
         return
 
     try:
-        if mode == 1:
-            run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs)
-        elif mode == 2:
+        if mode == LEARNING_MODE_3D:
+            run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs, planar=False)
+        elif mode == LEARNING_MODE_PLANAR:
+            run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs, planar=True)
+        elif mode == VERIFICATION_MODE:
             if not MARKER_LAYOUT_JSON_PATH.exists():
-                print(f"Error: {MARKER_LAYOUT_JSON_PATH} not found. Run mode 1 first.")
+                print(f"Error: {MARKER_LAYOUT_JSON_PATH} not found. Run a learning mode first.")
                 return
-            run_localization_mode(cap, dictionary, camera_matrix, dist_coeffs)
+            run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs)
     finally:
         cap.release()
         cv2.destroyAllWindows()

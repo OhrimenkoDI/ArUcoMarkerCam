@@ -211,16 +211,65 @@ def _rotation_matrix_to_euler_deg(rotation_matrix: np.ndarray):
     return np.degrees([roll, pitch, yaw])
 
 
+def _rotation_matrix_to_quaternion(rotation_matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(rotation_matrix, dtype=np.float64)
+    trace = np.trace(matrix)
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (matrix[2, 1] - matrix[1, 2]) / s
+        y = (matrix[0, 2] - matrix[2, 0]) / s
+        z = (matrix[1, 0] - matrix[0, 1]) / s
+    elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        s = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+        w = (matrix[2, 1] - matrix[1, 2]) / s
+        x = 0.25 * s
+        y = (matrix[0, 1] + matrix[1, 0]) / s
+        z = (matrix[0, 2] + matrix[2, 0]) / s
+    elif matrix[1, 1] > matrix[2, 2]:
+        s = np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+        w = (matrix[0, 2] - matrix[2, 0]) / s
+        x = (matrix[0, 1] + matrix[1, 0]) / s
+        y = 0.25 * s
+        z = (matrix[1, 2] + matrix[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+        w = (matrix[1, 0] - matrix[0, 1]) / s
+        x = (matrix[0, 2] + matrix[2, 0]) / s
+        y = (matrix[1, 2] + matrix[2, 1]) / s
+        z = 0.25 * s
+    quat = np.array([w, x, y, z], dtype=np.float64)
+    return quat / np.linalg.norm(quat)
+
+
+def _quaternion_to_rotation_matrix(quaternion: np.ndarray) -> np.ndarray:
+    w, x, y, z = np.asarray(quaternion, dtype=np.float64)
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
 def _average_transforms(transforms):
     translations = np.array([t[:3, 3] for t in transforms], dtype=np.float64)
-    rotvecs = []
+    quaternions = []
+    reference_quaternion = None
     for t in transforms:
-        rvec, _ = cv2.Rodrigues(t[:3, :3])
-        rotvecs.append(rvec.reshape(3))
+        q = _rotation_matrix_to_quaternion(t[:3, :3])
+        if reference_quaternion is None:
+            reference_quaternion = q
+        elif np.dot(q, reference_quaternion) < 0.0:
+            q = -q
+        quaternions.append(q)
     mean_transform = np.eye(4, dtype=np.float64)
     mean_transform[:3, 3] = np.mean(translations, axis=0)
-    mean_rvec = np.mean(np.array(rotvecs, dtype=np.float64), axis=0).reshape(3, 1)
-    mean_transform[:3, :3], _ = cv2.Rodrigues(mean_rvec)
+    mean_q = np.mean(np.array(quaternions, dtype=np.float64), axis=0)
+    mean_q /= np.linalg.norm(mean_q)
+    mean_transform[:3, :3] = _quaternion_to_rotation_matrix(mean_q)
     return mean_transform
 
 
@@ -297,11 +346,27 @@ def _detect_marker_poses(
     return marker_corners, marker_ids, poses
 
 
-def _compute_pose_consistency_mm(transforms) -> Optional[float]:
+def _compute_pose_consistency(transforms) -> Tuple[Optional[float], Optional[float]]:
     if len(transforms) < 2:
-        return None
-    translations = np.array([transform[:3, 3] for transform in transforms], dtype=np.float64)
-    return float(np.mean(np.std(translations, axis=0)))
+        return None, None
+    positions = np.array([t[:3, 3] for t in transforms], dtype=np.float64)
+    trans_mm = float(np.mean(np.std(positions, axis=0)))
+    quaternions = []
+    ref_q = None
+    for t in transforms:
+        q = _rotation_matrix_to_quaternion(t[:3, :3])
+        if ref_q is None:
+            ref_q = q
+        elif np.dot(q, ref_q) < 0.0:
+            q = -q
+        quaternions.append(q)
+    mean_q = np.mean(quaternions, axis=0)
+    mean_q /= np.linalg.norm(mean_q)
+    rot_deg = float(np.mean([
+        np.degrees(2.0 * np.arccos(min(1.0, abs(float(np.dot(q, mean_q))))))
+        for q in quaternions
+    ]))
+    return trans_mm, rot_deg
 
 
 def _detect_and_estimate(
@@ -409,6 +474,7 @@ class ArucoPoseTracker:
             if world_from_camera_candidates
             else None
         )
+        consistency_mm, consistency_deg = _compute_pose_consistency(world_from_camera_candidates)
         return {
             "frame": frame,
             "marker_corners": marker_corners,
@@ -416,7 +482,8 @@ class ArucoPoseTracker:
             "detected_poses": detected_poses,
             "world_from_camera": world_from_camera,
             "used_marker_ids": used_marker_ids,
-            "consistency_mm": _compute_pose_consistency_mm(world_from_camera_candidates),
+            "consistency_mm": consistency_mm,
+            "consistency_deg": consistency_deg,
             "capture_info": self.get_capture_info(),
             "marker_layout_ids": sorted(self._marker_world_transforms),
             "marker_length_mm": float(self._marker_length_mm),
