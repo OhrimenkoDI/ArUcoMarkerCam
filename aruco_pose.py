@@ -138,6 +138,29 @@ def _configure_camera(cap: cv2.VideoCapture) -> None:
         cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
 
 
+def _fourcc_to_str(value: float) -> str:
+    code = int(value)
+    if code <= 0:
+        return "----"
+    return "".join(chr((code >> (8 * index)) & 0xFF) for index in range(4))
+
+
+def _describe_capture(cap: cv2.VideoCapture, source, backend: int) -> dict:
+    return {
+        "source": str(source),
+        "backend": int(backend),
+        "backend_name": cap.getBackendName() if hasattr(cap, "getBackendName") else str(backend),
+        "requested_width": int(TARGET_WIDTH),
+        "requested_height": int(TARGET_HEIGHT),
+        "requested_fps": int(TARGET_FPS),
+        "requested_fourcc": str(TARGET_FOURCC),
+        "reported_width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        "reported_height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        "reported_fps": float(cap.get(cv2.CAP_PROP_FPS)),
+        "reported_fourcc": _fourcc_to_str(cap.get(cv2.CAP_PROP_FOURCC)),
+    }
+
+
 def _open_camera() -> Optional[cv2.VideoCapture]:
     for source, backend in _camera_attempts(CAMERA_SOURCE):
         cap = cv2.VideoCapture(source, backend)
@@ -149,6 +172,7 @@ def _open_camera() -> Optional[cv2.VideoCapture]:
             cap.read()
         ok, _ = cap.read()
         if ok:
+            setattr(cap, "_aruco_debug_info", _describe_capture(cap, source, backend))
             return cap
         cap.release()
     return None
@@ -217,6 +241,67 @@ def _solve_marker_pose(marker_corners, camera_matrix, dist_coeffs, marker_length
     return True, rvec, tvec
 
 
+def _compute_reprojection_error(
+    marker_corners,
+    rvec,
+    tvec,
+    camera_matrix,
+    dist_coeffs,
+    marker_length_mm,
+) -> float:
+    half = marker_length_mm * 0.5
+    object_points = np.array(
+        [[-half, half, 0.0], [half, half, 0.0], [half, -half, 0.0], [-half, -half, 0.0]],
+        dtype=np.float32,
+    )
+    image_points = np.asarray(marker_corners, dtype=np.float32).reshape(4, 2)
+    projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
+    return float(np.mean(np.linalg.norm(image_points - projected.reshape(4, 2), axis=1)))
+
+
+def _detect_marker_poses(
+    frame,
+    detector,
+    camera_matrix,
+    dist_coeffs,
+    marker_length_mm,
+):
+    marker_corners, marker_ids, _ = detector.detectMarkers(frame)
+    poses = {}
+
+    if marker_ids is None or len(marker_ids) == 0:
+        return marker_corners, marker_ids, poses
+
+    for corners, marker_id in zip(marker_corners, marker_ids.flatten()):
+        ok, rvec, tvec = _solve_marker_pose(corners, camera_matrix, dist_coeffs, marker_length_mm)
+        if not ok:
+            continue
+        marker_id = int(marker_id)
+        poses[marker_id] = {
+            "corners": corners,
+            "rvec": rvec,
+            "tvec": tvec,
+            "camera_from_marker": _rt_to_transform(rvec, tvec),
+            "reprojection_error": _compute_reprojection_error(
+                corners,
+                rvec,
+                tvec,
+                camera_matrix,
+                dist_coeffs,
+                marker_length_mm,
+            ),
+        }
+
+    return marker_corners, marker_ids, poses
+
+
+def _compute_pose_consistency_mm(transforms) -> Optional[float]:
+    if len(transforms) < 2:
+        return None
+    translations = np.array([transform[:3, 3] for transform in transforms], dtype=np.float64)
+    return float(np.mean(np.std(translations, axis=0)))
+
+
 def _detect_and_estimate(
     frame,
     detector,
@@ -225,22 +310,19 @@ def _detect_and_estimate(
     marker_length_mm,
     marker_world_transforms,
 ):
-    marker_corners, marker_ids, _ = detector.detectMarkers(frame)
-
-    if marker_ids is None or len(marker_ids) == 0:
-        return None
-
+    _, _, detected_poses = _detect_marker_poses(
+        frame,
+        detector,
+        camera_matrix,
+        dist_coeffs,
+        marker_length_mm,
+    )
     world_from_camera_candidates = []
-    for corners, marker_id in zip(marker_corners, marker_ids.flatten()):
-        marker_id = int(marker_id)
+    for marker_id, pose in detected_poses.items():
         if marker_id not in marker_world_transforms:
             continue
-        ok, rvec, tvec = _solve_marker_pose(corners, camera_matrix, dist_coeffs, marker_length_mm)
-        if not ok:
-            continue
-        camera_from_marker = _rt_to_transform(rvec, tvec)
         world_from_camera_candidates.append(
-            marker_world_transforms[marker_id] @ _invert_transform(camera_from_marker)
+            marker_world_transforms[marker_id] @ _invert_transform(pose["camera_from_marker"])
         )
 
     if not world_from_camera_candidates:
@@ -265,6 +347,7 @@ class ArucoPoseTracker:
         self._cap = _open_camera()
         if self._cap is None:
             raise RuntimeError(f"Cannot open camera source {CAMERA_SOURCE}")
+        self._capture_info = getattr(self._cap, "_aruco_debug_info", None)
 
     def get_pose(self) -> Optional[Tuple[float, float, float, float]]:
         """Read one frame and return (x_m, y_m, z_m, yaw_deg) or None if no known markers visible."""
@@ -292,6 +375,50 @@ class ArucoPoseTracker:
         yaw_deg = -float(rpy_deg[2])
 
         return x_m, y_m, z_m, yaw_deg
+
+    def get_capture_info(self) -> dict:
+        return dict(self._capture_info or {})
+
+    def analyze_frame(self):
+        ok, frame = self._cap.read()
+        if not ok:
+            return None
+
+        marker_corners, marker_ids, detected_poses = _detect_marker_poses(
+            frame,
+            self._detector,
+            self._camera_matrix,
+            self._dist_coeffs,
+            self._marker_length_mm,
+        )
+
+        world_from_camera_candidates = []
+        used_marker_ids = []
+        for marker_id, pose in detected_poses.items():
+            if marker_id not in self._marker_world_transforms:
+                continue
+            world_from_camera_candidates.append(
+                self._marker_world_transforms[marker_id] @ _invert_transform(pose["camera_from_marker"])
+            )
+            used_marker_ids.append(marker_id)
+
+        world_from_camera = (
+            _average_transforms(world_from_camera_candidates)
+            if world_from_camera_candidates
+            else None
+        )
+        return {
+            "frame": frame,
+            "marker_corners": marker_corners,
+            "marker_ids": marker_ids,
+            "detected_poses": detected_poses,
+            "world_from_camera": world_from_camera,
+            "used_marker_ids": used_marker_ids,
+            "consistency_mm": _compute_pose_consistency_mm(world_from_camera_candidates),
+            "capture_info": self.get_capture_info(),
+            "marker_layout_ids": sorted(self._marker_world_transforms),
+            "marker_length_mm": float(self._marker_length_mm),
+        }
 
     def close(self) -> None:
         if self._cap is not None:
