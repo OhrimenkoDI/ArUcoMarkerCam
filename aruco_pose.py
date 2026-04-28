@@ -20,6 +20,7 @@ TARGET_HEIGHT = int(os.environ.get("ARUCO_CAMERA_HEIGHT", "720"))
 TARGET_FPS = int(os.environ.get("ARUCO_CAMERA_FPS", "30"))
 TARGET_FOURCC = os.environ.get("ARUCO_CAMERA_FOURCC", "MJPG")
 LINUX_FALLBACK_SOURCES = ("/dev/video1", "/dev/video4", "/dev/video0")
+_LAST_CAPTURE_INFO = None
 
 _BACKEND_MAP = {
     "auto": cv2.CAP_ANY,
@@ -162,6 +163,7 @@ def _describe_capture(cap: cv2.VideoCapture, source, backend: int) -> dict:
 
 
 def _open_camera() -> Optional[cv2.VideoCapture]:
+    global _LAST_CAPTURE_INFO
     for source, backend in _camera_attempts(CAMERA_SOURCE):
         cap = cv2.VideoCapture(source, backend)
         if not cap.isOpened():
@@ -172,7 +174,7 @@ def _open_camera() -> Optional[cv2.VideoCapture]:
             cap.read()
         ok, _ = cap.read()
         if ok:
-            setattr(cap, "_aruco_debug_info", _describe_capture(cap, source, backend))
+            _LAST_CAPTURE_INFO = _describe_capture(cap, source, backend)
             return cap
         cap.release()
     return None
@@ -347,7 +349,7 @@ class ArucoPoseTracker:
         self._cap = _open_camera()
         if self._cap is None:
             raise RuntimeError(f"Cannot open camera source {CAMERA_SOURCE}")
-        self._capture_info = getattr(self._cap, "_aruco_debug_info", None)
+        self._capture_info = dict(_LAST_CAPTURE_INFO or {})
 
     def get_pose(self) -> Optional[Tuple[float, float, float, float]]:
         """Read one frame and return (x_m, y_m, z_m, yaw_deg) or None if no known markers visible."""
