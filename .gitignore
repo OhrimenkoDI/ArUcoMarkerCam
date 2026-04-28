@@ -29,10 +29,6 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Project-generated calibration artifacts
-camera_calibration.json
-camera_calibration.npz
-camera_calibration.yaml
 
 # Project debug output
 debug_corners/
