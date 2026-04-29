@@ -26,6 +26,7 @@ FAST_DETECTOR = os.environ.get("ARUCO_FAST_DETECTOR", "1").lower() not in ("0", 
 APRILTAG_DECIMATE = float(os.environ.get("ARUCO_APRILTAG_DECIMATE", "2.0"))
 LINUX_FALLBACK_SOURCES = ("/dev/video1", "/dev/video4", "/dev/video0")
 _LAST_CAPTURE_INFO = None
+_LAST_CAPTURE_ATTEMPTS = []
 
 _BACKEND_MAP = {
     "auto": cv2.CAP_ANY,
@@ -124,10 +125,9 @@ def _build_gstreamer_pipeline(source) -> Optional[str]:
 
 def _camera_attempts(source):
     normalized_source = _normalize_camera_source(source)
-    if CAMERA_BACKEND != "auto":
-        return [(normalized_source, _BACKEND_MAP.get(CAMERA_BACKEND, cv2.CAP_ANY))]
-
     if os.name == "nt":
+        if CAMERA_BACKEND != "auto":
+            return [(normalized_source, _BACKEND_MAP.get(CAMERA_BACKEND, cv2.CAP_ANY))]
         return [
             (normalized_source, cv2.CAP_DSHOW),
             (normalized_source, getattr(cv2, "CAP_MSMF", cv2.CAP_ANY)),
@@ -143,6 +143,19 @@ def _camera_attempts(source):
 
     for linux_source in linux_sources:
         pipeline = _build_gstreamer_pipeline(linux_source)
+        if CAMERA_BACKEND == "gstreamer":
+            if pipeline is not None:
+                attempts.append((pipeline, getattr(cv2, "CAP_GSTREAMER", cv2.CAP_ANY)))
+            continue
+        if CAMERA_BACKEND == "v4l2":
+            if isinstance(linux_source, str) and linux_source.startswith("/dev/video"):
+                attempts.append((linux_source, cv2.CAP_V4L2))
+            elif isinstance(linux_source, int):
+                attempts.append((linux_source, cv2.CAP_V4L2))
+            continue
+        if CAMERA_BACKEND != "auto":
+            attempts.append((linux_source, _BACKEND_MAP.get(CAMERA_BACKEND, cv2.CAP_ANY)))
+            continue
         if pipeline is not None:
             attempts.append((pipeline, getattr(cv2, "CAP_GSTREAMER", cv2.CAP_ANY)))
             attempts.append((linux_source, cv2.CAP_V4L2))
@@ -185,6 +198,25 @@ def _describe_capture(cap: cv2.VideoCapture, source, backend: int) -> dict:
     }
 
 
+def _describe_attempt(source, backend: int) -> dict:
+    return {
+        "source": str(source),
+        "backend": int(backend),
+        "backend_name": _backend_name(backend),
+    }
+
+
+def _backend_name(backend: int) -> str:
+    names = {
+        cv2.CAP_ANY: "CAP_ANY",
+        cv2.CAP_V4L2: "CAP_V4L2",
+        getattr(cv2, "CAP_GSTREAMER", cv2.CAP_ANY): "CAP_GSTREAMER",
+        cv2.CAP_DSHOW: "CAP_DSHOW",
+        getattr(cv2, "CAP_MSMF", cv2.CAP_ANY): "CAP_MSMF",
+    }
+    return names.get(backend, str(backend))
+
+
 def _save_frame_artifact(frame, label: str, capture_info: Optional[dict] = None) -> Path:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -207,8 +239,10 @@ def _save_frame_artifact(frame, label: str, capture_info: Optional[dict] = None)
 
 
 def _open_camera() -> Optional[cv2.VideoCapture]:
-    global _LAST_CAPTURE_INFO
+    global _LAST_CAPTURE_INFO, _LAST_CAPTURE_ATTEMPTS
+    _LAST_CAPTURE_ATTEMPTS = []
     for source, backend in _camera_attempts(CAMERA_SOURCE):
+        _LAST_CAPTURE_ATTEMPTS.append(_describe_attempt(source, backend))
         cap = cv2.VideoCapture(source, backend)
         if not cap.isOpened():
             cap.release()
@@ -487,7 +521,9 @@ class ArucoPoseTracker:
         self._detector = _ArucoDetectorCompat(self._dictionary)
         self._cap = _open_camera()
         if self._cap is None:
-            raise RuntimeError(f"Cannot open camera source {CAMERA_SOURCE}")
+            raise RuntimeError(
+                f"Cannot open camera source {CAMERA_SOURCE}; attempts={_LAST_CAPTURE_ATTEMPTS}"
+            )
         self._capture_info = dict(_LAST_CAPTURE_INFO or {})
 
     def get_pose(self) -> Optional[Tuple[float, float, float, float]]:
