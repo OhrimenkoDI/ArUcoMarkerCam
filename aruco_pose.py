@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -12,6 +13,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 CALIBRATION_JSON_PATH = SCRIPT_DIR / "camera_calibration.json"
 MARKER_LAYOUT_JSON_PATH = SCRIPT_DIR / "marker_layout.json"
+ARTIFACTS_DIR = SCRIPT_DIR / "artifacts"
 
 CAMERA_SOURCE = os.environ.get("ARUCO_CAMERA_SOURCE", "0")
 CAMERA_BACKEND = os.environ.get("ARUCO_CAMERA_BACKEND", "auto").lower()
@@ -160,6 +162,27 @@ def _describe_capture(cap: cv2.VideoCapture, source, backend: int) -> dict:
         "reported_fps": float(cap.get(cv2.CAP_PROP_FPS)),
         "reported_fourcc": _fourcc_to_str(cap.get(cv2.CAP_PROP_FOURCC)),
     }
+
+
+def _save_frame_artifact(frame, label: str, capture_info: Optional[dict] = None) -> Path:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in label)
+    image_path = ARTIFACTS_DIR / f"aruco_{safe_label}_{timestamp}.png"
+
+    if not cv2.imwrite(str(image_path), frame):
+        raise RuntimeError(f"Failed to save frame artifact: {image_path}")
+
+    metadata = {
+        "label": label,
+        "image_path": str(image_path),
+        "shape": list(frame.shape) if hasattr(frame, "shape") else None,
+        "dtype": str(frame.dtype) if hasattr(frame, "dtype") else None,
+        "capture_info": capture_info or {},
+    }
+    metadata_path = image_path.with_suffix(".json")
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return image_path
 
 
 def _open_camera() -> Optional[cv2.VideoCapture]:
@@ -422,26 +445,30 @@ class ArucoPoseTracker:
         if not ok:
             return None
 
-        world_from_camera = _detect_and_estimate(
-            frame,
-            self._detector,
-            self._camera_matrix,
-            self._dist_coeffs,
-            self._marker_length_mm,
-            self._marker_world_transforms,
-        )
-        if world_from_camera is None:
-            return None
+        try:
+            world_from_camera = _detect_and_estimate(
+                frame,
+                self._detector,
+                self._camera_matrix,
+                self._dist_coeffs,
+                self._marker_length_mm,
+                self._marker_world_transforms,
+            )
+            if world_from_camera is None:
+                return None
 
-        xyz_mm = world_from_camera[:3, 3]
-        rpy_deg = _rotation_matrix_to_euler_deg(world_from_camera[:3, :3])
+            xyz_mm = world_from_camera[:3, 3]
+            rpy_deg = _rotation_matrix_to_euler_deg(world_from_camera[:3, :3])
 
-        x_m = float(xyz_mm[0]) / 1000.0
-        y_m = float(xyz_mm[1]) / 1000.0
-        z_m = float(xyz_mm[2]) / 1000.0
-        yaw_deg = -float(rpy_deg[2])
+            x_m = float(xyz_mm[0]) / 1000.0
+            y_m = float(xyz_mm[1]) / 1000.0
+            z_m = float(xyz_mm[2]) / 1000.0
+            yaw_deg = -float(rpy_deg[2])
 
-        return x_m, y_m, z_m, yaw_deg
+            return x_m, y_m, z_m, yaw_deg
+        except Exception as exc:
+            artifact_path = _save_frame_artifact(frame, "get_pose_error", self.get_capture_info())
+            raise RuntimeError(f"ArUco frame processing failed; saved frame artifact: {artifact_path}") from exc
 
     def get_capture_info(self) -> dict:
         return dict(self._capture_info or {})
@@ -451,43 +478,47 @@ class ArucoPoseTracker:
         if not ok:
             return None
 
-        marker_corners, marker_ids, detected_poses = _detect_marker_poses(
-            frame,
-            self._detector,
-            self._camera_matrix,
-            self._dist_coeffs,
-            self._marker_length_mm,
-        )
-
-        world_from_camera_candidates = []
-        used_marker_ids = []
-        for marker_id, pose in detected_poses.items():
-            if marker_id not in self._marker_world_transforms:
-                continue
-            world_from_camera_candidates.append(
-                self._marker_world_transforms[marker_id] @ _invert_transform(pose["camera_from_marker"])
+        try:
+            marker_corners, marker_ids, detected_poses = _detect_marker_poses(
+                frame,
+                self._detector,
+                self._camera_matrix,
+                self._dist_coeffs,
+                self._marker_length_mm,
             )
-            used_marker_ids.append(marker_id)
 
-        world_from_camera = (
-            _average_transforms(world_from_camera_candidates)
-            if world_from_camera_candidates
-            else None
-        )
-        consistency_mm, consistency_deg = _compute_pose_consistency(world_from_camera_candidates)
-        return {
-            "frame": frame,
-            "marker_corners": marker_corners,
-            "marker_ids": marker_ids,
-            "detected_poses": detected_poses,
-            "world_from_camera": world_from_camera,
-            "used_marker_ids": used_marker_ids,
-            "consistency_mm": consistency_mm,
-            "consistency_deg": consistency_deg,
-            "capture_info": self.get_capture_info(),
-            "marker_layout_ids": sorted(self._marker_world_transforms),
-            "marker_length_mm": float(self._marker_length_mm),
-        }
+            world_from_camera_candidates = []
+            used_marker_ids = []
+            for marker_id, pose in detected_poses.items():
+                if marker_id not in self._marker_world_transforms:
+                    continue
+                world_from_camera_candidates.append(
+                    self._marker_world_transforms[marker_id] @ _invert_transform(pose["camera_from_marker"])
+                )
+                used_marker_ids.append(marker_id)
+
+            world_from_camera = (
+                _average_transforms(world_from_camera_candidates)
+                if world_from_camera_candidates
+                else None
+            )
+            consistency_mm, consistency_deg = _compute_pose_consistency(world_from_camera_candidates)
+            return {
+                "frame": frame,
+                "marker_corners": marker_corners,
+                "marker_ids": marker_ids,
+                "detected_poses": detected_poses,
+                "world_from_camera": world_from_camera,
+                "used_marker_ids": used_marker_ids,
+                "consistency_mm": consistency_mm,
+                "consistency_deg": consistency_deg,
+                "capture_info": self.get_capture_info(),
+                "marker_layout_ids": sorted(self._marker_world_transforms),
+                "marker_length_mm": float(self._marker_length_mm),
+            }
+        except Exception as exc:
+            artifact_path = _save_frame_artifact(frame, "analyze_frame_error", self.get_capture_info())
+            raise RuntimeError(f"ArUco frame analysis failed; saved frame artifact: {artifact_path}") from exc
 
     def close(self) -> None:
         if self._cap is not None:

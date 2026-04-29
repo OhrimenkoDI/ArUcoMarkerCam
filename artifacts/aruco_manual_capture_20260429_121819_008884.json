@@ -1,0 +1,23 @@
+{
+  "label": "manual_capture",
+  "image_path": "C:\\Users\\OkhrimenkoDI\\YandexDisk\\2026-ODI\\2026-Python\\Yolo1\\ArUcoMarkerCam\\artifacts\\aruco_manual_capture_20260429_121819_008884.png",
+  "shape": [
+    720,
+    1280,
+    3
+  ],
+  "dtype": "uint8",
+  "capture_info": {
+    "source": "0",
+    "backend": 700,
+    "backend_name": "DSHOW",
+    "requested_width": 1280,
+    "requested_height": 720,
+    "requested_fps": 30,
+    "requested_fourcc": "MJPG",
+    "reported_width": 1280,
+    "reported_height": 720,
+    "reported_fps": 30.00003000003,
+    "reported_fourcc": "YUY2"
+  }
+}
