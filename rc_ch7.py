@@ -122,6 +122,7 @@ def main() -> None:
         print("ArUco трекер запущен")
 
         sent = 0
+        last_rate_time = time.perf_counter()
         prev_yaw_deg = None
         last_pose = None  # последняя известная поза, если маркеры временно не видны
         while True:
@@ -144,6 +145,10 @@ def main() -> None:
             send_heading(conn, yaw_deg, x_m, y_m, z_m)
             sent += 1
             if sent % 50 == 0:
+                now = time.perf_counter()
+                dt = now - last_rate_time
+                real_hz = 50.0 / dt if dt > 0 else 0.0
+                last_rate_time = now
                 src = "aruco" if last_pose is not None else "резерв"
                 step_info = ""
                 highlight_on = ""
@@ -154,7 +159,7 @@ def main() -> None:
                         step_info += "  !!! angle step > 5deg"
                         highlight_on = "\033[93m"
                         highlight_off = "\033[0m"
-                print(f"{highlight_on}  sent={sent}  [{src}]  x={x_m:.3f}m  y={y_m:.3f}m  z={z_m:.3f}m  az={yaw_deg:.1f}deg{step_info}{highlight_off}")
+                print(f"{highlight_on}  sent={sent}  hz={real_hz:.1f}  [{src}]  x={x_m:.3f}m  y={y_m:.3f}m  z={z_m:.3f}m  az={yaw_deg:.1f}deg{step_info}{highlight_off}")
 
             remaining = INTERVAL - (time.perf_counter() - t0)
             if remaining > 0:
