@@ -1,5 +1,6 @@
 import math
 import sys
+import threading
 import time
 
 from pymavlink import mavutil
@@ -35,6 +36,44 @@ INTERVAL = 0.02  # 50 Hz — держит override активным (RC_OVERRIDE
 # ── Внешний азимут (вместо компаса) ──────────────────────────────────────────
 AZIMUTH_DEG = 10  # резервное значение, если маркеры не видны
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+class PoseWorker:
+    def __init__(self, tracker: ArucoPoseTracker):
+        self._tracker = tracker
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="aruco-pose", daemon=True)
+        self._pose = None
+        self._visible = False
+        self._frames = 0
+        self._error = None
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def snapshot(self):
+        with self._lock:
+            return self._pose, self._visible, self._frames, self._error
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                pose = self._tracker.get_pose()
+            except Exception as exc:
+                with self._lock:
+                    self._error = exc
+                return
+
+            with self._lock:
+                self._frames += 1
+                self._visible = pose is not None
+                if pose is not None:
+                    self._pose = pose
 
 
 def make_connection() -> mavutil.mavfile:
@@ -117,18 +156,26 @@ def main() -> None:
     print("GPS origin установлен")
 
     tracker = None
+    pose_worker = None
     try:
         tracker = ArucoPoseTracker()
         print("ArUco трекер запущен")
+        print(f"Capture: {tracker.get_capture_info()}")
+
+        pose_worker = PoseWorker(tracker)
+        pose_worker.start()
 
         sent = 0
         last_rate_time = time.perf_counter()
+        last_vision_frames = 0
         prev_yaw_deg = None
         last_pose = None  # последняя известная поза, если маркеры временно не видны
         while True:
             t0 = time.perf_counter()
 
-            pose = tracker.get_pose()
+            pose, marker_visible, vision_frames, vision_error = pose_worker.snapshot()
+            if vision_error is not None:
+                raise vision_error
             if pose is not None:
                 last_pose = pose
             if last_pose is not None:
@@ -148,8 +195,15 @@ def main() -> None:
                 now = time.perf_counter()
                 dt = now - last_rate_time
                 real_hz = 50.0 / dt if dt > 0 else 0.0
+                vision_hz = (vision_frames - last_vision_frames) / dt if dt > 0 else 0.0
                 last_rate_time = now
-                src = "aruco" if last_pose is not None else "резерв"
+                last_vision_frames = vision_frames
+                if marker_visible:
+                    src = "aruco"
+                elif last_pose is not None:
+                    src = "last"
+                else:
+                    src = "резерв"
                 step_info = ""
                 highlight_on = ""
                 highlight_off = ""
@@ -159,7 +213,7 @@ def main() -> None:
                         step_info += "  !!! angle step > 5deg"
                         highlight_on = "\033[93m"
                         highlight_off = "\033[0m"
-                print(f"{highlight_on}  sent={sent}  hz={real_hz:.1f}  [{src}]  x={x_m:.3f}m  y={y_m:.3f}m  z={z_m:.3f}m  az={yaw_deg:.1f}deg{step_info}{highlight_off}")
+                print(f"{highlight_on}  sent={sent}  send_hz={real_hz:.1f}  vision_hz={vision_hz:.1f}  [{src}]  x={x_m:.3f}m  y={y_m:.3f}m  z={z_m:.3f}m  az={yaw_deg:.1f}deg{step_info}{highlight_off}")
 
             remaining = INTERVAL - (time.perf_counter() - t0)
             if remaining > 0:
@@ -172,6 +226,8 @@ def main() -> None:
             time.sleep(INTERVAL)
 
     finally:
+        if pose_worker is not None:
+            pose_worker.close()
         if tracker is not None:
             tracker.close()
         conn.close()

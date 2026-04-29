@@ -21,6 +21,9 @@ TARGET_WIDTH = int(os.environ.get("ARUCO_CAMERA_WIDTH", "1280"))
 TARGET_HEIGHT = int(os.environ.get("ARUCO_CAMERA_HEIGHT", "720"))
 TARGET_FPS = int(os.environ.get("ARUCO_CAMERA_FPS", "30"))
 TARGET_FOURCC = os.environ.get("ARUCO_CAMERA_FOURCC", "MJPG")
+PROCESS_SCALE = float(os.environ.get("ARUCO_PROCESS_SCALE", "0.5"))
+FAST_DETECTOR = os.environ.get("ARUCO_FAST_DETECTOR", "1").lower() not in ("0", "false", "no")
+APRILTAG_DECIMATE = float(os.environ.get("ARUCO_APRILTAG_DECIMATE", "2.0"))
 LINUX_FALLBACK_SOURCES = ("/dev/video1", "/dev/video4", "/dev/video0")
 _LAST_CAPTURE_INFO = None
 
@@ -65,21 +68,39 @@ class _ArucoDetectorCompat:
 
     def __init__(self, dictionary):
         self._dictionary = dictionary
+        self._parameters = _create_detector_parameters()
         if hasattr(cv2.aruco, "ArucoDetector"):
-            self._detector = cv2.aruco.ArucoDetector(dictionary)
+            self._detector = cv2.aruco.ArucoDetector(dictionary, self._parameters)
             self._use_modern_api = True
         else:
             self._detector = None
             self._use_modern_api = False
-            if hasattr(cv2.aruco, "DetectorParameters"):
-                self._parameters = cv2.aruco.DetectorParameters()
-            else:
-                self._parameters = cv2.aruco.DetectorParameters_create()
 
     def detectMarkers(self, frame):
         if self._use_modern_api:
             return self._detector.detectMarkers(frame)
         return cv2.aruco.detectMarkers(frame, self._dictionary, parameters=self._parameters)
+
+
+def _set_if_has(obj, name: str, value) -> None:
+    if hasattr(obj, name):
+        setattr(obj, name, value)
+
+
+def _create_detector_parameters():
+    if hasattr(cv2.aruco, "DetectorParameters"):
+        parameters = cv2.aruco.DetectorParameters()
+    else:
+        parameters = cv2.aruco.DetectorParameters_create()
+
+    if FAST_DETECTOR:
+        _set_if_has(parameters, "cornerRefinementMethod", cv2.aruco.CORNER_REFINE_NONE)
+        _set_if_has(parameters, "adaptiveThreshWinSizeMin", 3)
+        _set_if_has(parameters, "adaptiveThreshWinSizeMax", 23)
+        _set_if_has(parameters, "adaptiveThreshWinSizeStep", 10)
+        _set_if_has(parameters, "minMarkerPerimeterRate", 0.03)
+        _set_if_has(parameters, "aprilTagQuadDecimate", APRILTAG_DECIMATE)
+    return parameters
 
 
 def _normalize_camera_source(source):
@@ -333,21 +354,49 @@ def _compute_reprojection_error(
     return float(np.mean(np.linalg.norm(image_points - projected.reshape(4, 2), axis=1)))
 
 
+def _prepare_detection_frame(frame, camera_matrix):
+    detection_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    scaled_camera_matrix = camera_matrix
+
+    if 0.0 < PROCESS_SCALE < 1.0:
+        detection_frame = cv2.resize(
+            detection_frame,
+            None,
+            fx=PROCESS_SCALE,
+            fy=PROCESS_SCALE,
+            interpolation=cv2.INTER_AREA,
+        )
+        scaled_camera_matrix = camera_matrix.copy()
+        scaled_camera_matrix[0, 0] *= PROCESS_SCALE
+        scaled_camera_matrix[1, 1] *= PROCESS_SCALE
+        scaled_camera_matrix[0, 2] *= PROCESS_SCALE
+        scaled_camera_matrix[1, 2] *= PROCESS_SCALE
+
+    return detection_frame, scaled_camera_matrix
+
+
 def _detect_marker_poses(
     frame,
     detector,
     camera_matrix,
     dist_coeffs,
     marker_length_mm,
+    include_reprojection_error=True,
 ):
-    marker_corners, marker_ids, _ = detector.detectMarkers(frame)
+    detection_frame, detection_camera_matrix = _prepare_detection_frame(frame, camera_matrix)
+    marker_corners, marker_ids, _ = detector.detectMarkers(detection_frame)
     poses = {}
 
     if marker_ids is None or len(marker_ids) == 0:
         return marker_corners, marker_ids, poses
 
     for corners, marker_id in zip(marker_corners, marker_ids.flatten()):
-        ok, rvec, tvec = _solve_marker_pose(corners, camera_matrix, dist_coeffs, marker_length_mm)
+        ok, rvec, tvec = _solve_marker_pose(
+            corners,
+            detection_camera_matrix,
+            dist_coeffs,
+            marker_length_mm,
+        )
         if not ok:
             continue
         marker_id = int(marker_id)
@@ -356,15 +405,16 @@ def _detect_marker_poses(
             "rvec": rvec,
             "tvec": tvec,
             "camera_from_marker": _rt_to_transform(rvec, tvec),
-            "reprojection_error": _compute_reprojection_error(
+        }
+        if include_reprojection_error:
+            poses[marker_id]["reprojection_error"] = _compute_reprojection_error(
                 corners,
                 rvec,
                 tvec,
-                camera_matrix,
+                detection_camera_matrix,
                 dist_coeffs,
                 marker_length_mm,
-            ),
-        }
+            )
 
     return marker_corners, marker_ids, poses
 
@@ -406,6 +456,7 @@ def _detect_and_estimate(
         camera_matrix,
         dist_coeffs,
         marker_length_mm,
+        include_reprojection_error=False,
     )
     world_from_camera_candidates = []
     for marker_id, pose in detected_poses.items():
