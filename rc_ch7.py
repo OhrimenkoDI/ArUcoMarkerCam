@@ -122,6 +122,7 @@ def main() -> None:
         print("ArUco трекер запущен")
 
         sent = 0
+        prev_yaw_deg = None
         last_pose = None  # последняя известная поза, если маркеры временно не видны
         while True:
             t0 = time.perf_counter()
@@ -134,12 +135,26 @@ def main() -> None:
             else:
                 x_m, y_m, z_m, yaw_deg = 0.0, 0.0, 0.0, float(AZIMUTH_DEG)
 
+            yaw_step_deg = None
+            if prev_yaw_deg is not None:
+                yaw_step_deg = abs((yaw_deg - prev_yaw_deg + 180.0) % 360.0 - 180.0)
+            prev_yaw_deg = yaw_deg
+
             #send_override(conn, PWM_CH6, PWM_CH7)
             send_heading(conn, yaw_deg, x_m, y_m, z_m)
             sent += 1
-            if sent % 5 == 0:
+            if sent % 50 == 0:
                 src = "aruco" if last_pose is not None else "резерв"
-                print(f"  sent={sent}  [{src}]  x={x_m:.3f}m  y={y_m:.3f}m  z={z_m:.3f}m  az={yaw_deg:.1f}°")
+                step_info = ""
+                highlight_on = ""
+                highlight_off = ""
+                if yaw_step_deg is not None:
+                    step_info = f"  d_az={yaw_step_deg:.1f}deg"
+                    if yaw_step_deg > 5.0:
+                        step_info += "  !!! angle step > 5deg"
+                        highlight_on = "\033[93m"
+                        highlight_off = "\033[0m"
+                print(f"{highlight_on}  sent={sent}  [{src}]  x={x_m:.3f}m  y={y_m:.3f}m  z={z_m:.3f}m  az={yaw_deg:.1f}deg{step_info}{highlight_off}")
 
             remaining = INTERVAL - (time.perf_counter() - t0)
             if remaining > 0:
