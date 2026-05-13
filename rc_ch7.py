@@ -38,6 +38,9 @@ AZIMUTH_DEG = 10  # резервное значение, если маркеры
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+CAMERA_AZIMUTH_OFFSET_DEG = 180.0  # camera yaw correction: final yaw = measured yaw + this constant
+
+
 class PoseWorker:
     def __init__(self, tracker: ArucoPoseTracker):
         self._tracker = tracker
@@ -182,6 +185,7 @@ def main() -> None:
                 x_m, y_m, z_m, yaw_deg = last_pose
             else:
                 x_m, y_m, z_m, yaw_deg = 0.0, 0.0, 0.0, float(AZIMUTH_DEG)
+            yaw_deg = (yaw_deg + CAMERA_AZIMUTH_OFFSET_DEG) % 360.0
 
             yaw_step_deg = None
             if prev_yaw_deg is not None:
