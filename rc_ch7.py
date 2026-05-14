@@ -193,7 +193,7 @@ def main() -> None:
             prev_yaw_deg = yaw_deg
 
             #send_override(conn, PWM_CH6, PWM_CH7)
-            send_heading(conn, yaw_deg, x_m, y_m, z_m)
+            send_heading(conn, yaw_deg, x_m, y_m, -z_m)
             sent += 1
             if sent % 50 == 0:
                 now = time.perf_counter()
