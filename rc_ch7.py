@@ -34,11 +34,11 @@ PWM_CH7 = 1500
 INTERVAL = 0.02  # 50 Hz — держит override активным (RC_OVERRIDE_TIME = 3 сек)
 
 # ── Внешний азимут (вместо компаса) ──────────────────────────────────────────
-AZIMUTH_DEG = 10  # резервное значение, если маркеры не видны
+AZIMUTH_DEG = 0  # резервное значение, если маркеры не видны
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-CAMERA_AZIMUTH_OFFSET_DEG = 180.0  # camera yaw correction: final yaw = measured yaw + this constant
+CAMERA_AZIMUTH_OFFSET_DEG = 0.0  # camera yaw correction: final yaw = measured yaw + this constant
 
 
 class PoseWorker:
