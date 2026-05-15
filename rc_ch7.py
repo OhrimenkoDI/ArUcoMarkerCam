@@ -41,6 +41,11 @@ AZIMUTH_DEG = 0  # резервное значение, если маркеры 
 CAMERA_AZIMUTH_OFFSET_DEG = 0.0  # camera yaw correction: final yaw = measured yaw + this constant
 
 
+def pose_to_ardupilot_position(x_m: float, y_m: float, z_m: float):
+    """Convert marker-map pose to ArduPilot local position: X forward, Y right, Z down."""
+    return y_m, x_m, -z_m
+
+
 class PoseWorker:
     def __init__(self, tracker: ArucoPoseTracker):
         self._tracker = tracker
@@ -192,8 +197,10 @@ def main() -> None:
                 yaw_step_deg = abs((yaw_deg - prev_yaw_deg + 180.0) % 360.0 - 180.0)
             prev_yaw_deg = yaw_deg
 
+            ap_x_m, ap_y_m, ap_z_m = pose_to_ardupilot_position(x_m, y_m, z_m)
+
             #send_override(conn, PWM_CH6, PWM_CH7)
-            send_heading(conn, yaw_deg, x_m, y_m, -z_m)
+            send_heading(conn, yaw_deg, ap_x_m, ap_y_m, ap_z_m)
             sent += 1
             if sent % 50 == 0:
                 now = time.perf_counter()
@@ -217,7 +224,7 @@ def main() -> None:
                         step_info += "  !!! angle step > 5deg"
                         highlight_on = "\033[93m"
                         highlight_off = "\033[0m"
-                print(f"{highlight_on}  sent={sent}  send_hz={real_hz:.1f}  vision_hz={vision_hz:.1f}  [{src}]  x={x_m:.3f}m  y={y_m:.3f}m  z={z_m:.3f}m  az={yaw_deg:.1f}deg{step_info}{highlight_off}")
+                print(f"{highlight_on}  sent={sent}  send_hz={real_hz:.1f}  vision_hz={vision_hz:.1f}  [{src}]  aruco_x={x_m:.3f}m  aruco_y={y_m:.3f}m  aruco_z={z_m:.3f}m  ap_x={ap_x_m:.3f}m  ap_y={ap_y_m:.3f}m  ap_z={ap_z_m:.3f}m  az={yaw_deg:.1f}deg{step_info}{highlight_off}")
 
             remaining = INTERVAL - (time.perf_counter() - t0)
             if remaining > 0:
