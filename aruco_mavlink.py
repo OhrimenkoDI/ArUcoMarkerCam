@@ -56,10 +56,10 @@ TARGET_FPS = 30
 TARGET_FOURCC = "MJPG"
 
 # ---------------------------------------------------------------------------
-# ArUco
+# ArUco fallback values. The real flight settings are read from marker_layout.json.
 # ---------------------------------------------------------------------------
-DICTIONARY_NAME = "DICT_4X4_50"
-ARUCO_MARKER_LENGTH_MM = 158.0
+DICTIONARY_NAME = "DICT_APRILTAG_36h11"
+ARUCO_MARKER_LENGTH_MM = 285.0
 
 # ---------------------------------------------------------------------------
 # MAVLink
@@ -96,8 +96,8 @@ def load_calibration():
     return camera_matrix, dist_coeffs
 
 
-def get_dictionary():
-    return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, DICTIONARY_NAME))
+def get_dictionary(dictionary_name=DICTIONARY_NAME):
+    return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionary_name))
 
 
 def open_camera():
@@ -131,9 +131,9 @@ def build_marker_object_points(marker_length_mm):
     ], dtype=np.float32)
 
 
-def solve_marker_pose(corners, camera_matrix, dist_coeffs):
+def solve_marker_pose(corners, camera_matrix, dist_coeffs, marker_length_mm):
     image_pts = np.asarray(corners, dtype=np.float32).reshape(4, 2)
-    obj_pts = build_marker_object_points(ARUCO_MARKER_LENGTH_MM)
+    obj_pts = build_marker_object_points(marker_length_mm)
     ok, rvec, tvec = cv2.solvePnP(
         obj_pts, image_pts, camera_matrix, dist_coeffs,
         flags=cv2.SOLVEPNP_IPPE_SQUARE,
@@ -162,14 +162,14 @@ def invert_transform(T):
     return Ti
 
 
-def detect_marker_poses(frame, dictionary, camera_matrix, dist_coeffs):
+def detect_marker_poses(frame, dictionary, camera_matrix, dist_coeffs, marker_length_mm):
     detector = cv2.aruco.ArucoDetector(dictionary)
     corners_list, ids, _ = detector.detectMarkers(frame)
     poses = {}
     if ids is None or len(ids) == 0:
         return poses
     for corners, mid in zip(corners_list, ids.flatten()):
-        ok, rvec, tvec, err = solve_marker_pose(corners, camera_matrix, dist_coeffs)
+        ok, rvec, tvec, err = solve_marker_pose(corners, camera_matrix, dist_coeffs, marker_length_mm)
         if ok:
             poses[int(mid)] = {
                 "camera_from_marker": rt_to_transform(rvec, tvec),
@@ -307,7 +307,16 @@ def ema_update(ema_dict, key, value):
 # Main loop
 # ===========================================================================
 
-def run(cap, dictionary, camera_matrix, dist_coeffs, conn, marker_world_transforms, marker_counts):
+def run(
+    cap,
+    dictionary,
+    camera_matrix,
+    dist_coeffs,
+    conn,
+    marker_world_transforms,
+    marker_counts,
+    marker_length_mm,
+):
     marker_error_ema = {}
     quality_ema = None
     last_send_t = 0.0
@@ -327,7 +336,13 @@ def run(cap, dictionary, camera_matrix, dist_coeffs, conn, marker_world_transfor
         now = time.perf_counter()
         frame_count += 1
 
-        detected_poses = detect_marker_poses(frame, dictionary, camera_matrix, dist_coeffs)
+        detected_poses = detect_marker_poses(
+            frame,
+            dictionary,
+            camera_matrix,
+            dist_coeffs,
+            marker_length_mm,
+        )
 
         for mid, pose in detected_poses.items():
             ema_update(marker_error_ema, mid, pose["reprojection_error_px"])
@@ -394,11 +409,14 @@ def main():
         sys.exit(1)
 
     camera_matrix, dist_coeffs = load_calibration()
-    dictionary = get_dictionary()
-    _, marker_world_transforms, marker_counts = load_marker_layout()
+    layout_payload, marker_world_transforms, marker_counts = load_marker_layout()
+    dictionary_name = layout_payload.get("dictionary_name", DICTIONARY_NAME)
+    marker_length_mm = float(layout_payload.get("marker_length_mm", ARUCO_MARKER_LENGTH_MM))
+    dictionary = get_dictionary(dictionary_name)
 
     print(f"[Map] loaded {len(marker_world_transforms)} markers: "
           f"{sorted(marker_world_transforms.keys())}")
+    print(f"[Map] dictionary={dictionary_name}  marker_length={marker_length_mm:g}mm")
 
     cap = open_camera()
     if cap is None:
@@ -410,7 +428,7 @@ def main():
 
     try:
         run(cap, dictionary, camera_matrix, dist_coeffs, conn,
-            marker_world_transforms, marker_counts)
+            marker_world_transforms, marker_counts, marker_length_mm)
     finally:
         cap.release()
         print("[Done]")

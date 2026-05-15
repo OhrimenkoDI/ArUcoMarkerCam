@@ -1,6 +1,7 @@
 import json
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -17,9 +18,10 @@ TARGET_FPS = 30
 TARGET_FOURCC = "MJPG"
 WINDOW_TITLE = "Group ArUco Detection"
 SELECTION_WINDOW_TITLE = "Select Mode"
+GRAPH_WINDOW_TITLE = "Mode 3 pose history"
 
 DICTIONARY_NAME = "DICT_APRILTAG_36h11"
-ARUCO_MARKER_LENGTH_MM = 168.0
+ARUCO_MARKER_LENGTH_MM = 285.0
 AXIS_LENGTH_MM = 60.0
 BASE_MARKER_ID = 0
 LEARNING_MODE_3D = 1
@@ -35,6 +37,13 @@ ERROR_COLOR = (80, 80, 255)
 QUALITY_GOOD_COLOR = (0, 220, 0)
 QUALITY_MED_COLOR = (0, 200, 220)
 QUALITY_BAD_COLOR = (60, 60, 255)
+
+GRAPH_HISTORY_FRAMES = 300
+GRAPH_WIDTH = 1280
+GRAPH_HEIGHT = 720
+GRAPH_BG_COLOR = (24, 24, 24)
+GRAPH_GRID_COLOR = (55, 55, 55)
+GRAPH_TEXT_COLOR = (225, 225, 225)
 
 # EMA smoothing factor for per-marker reprojection error and quality score
 EMA_ALPHA = 0.1
@@ -328,7 +337,13 @@ def choose_mode():
     return select_mode_by_key()
 
 
-def detect_marker_poses(frame, dictionary, camera_matrix, dist_coeffs):
+def detect_marker_poses(
+    frame,
+    dictionary,
+    camera_matrix,
+    dist_coeffs,
+    marker_length_mm=ARUCO_MARKER_LENGTH_MM,
+):
     detector = cv2.aruco.ArucoDetector(dictionary)
     marker_corners, marker_ids, _ = detector.detectMarkers(frame)
     poses = {}
@@ -341,7 +356,7 @@ def detect_marker_poses(frame, dictionary, camera_matrix, dist_coeffs):
             corners,
             camera_matrix,
             dist_coeffs,
-            ARUCO_MARKER_LENGTH_MM,
+            marker_length_mm,
         )
         if pose_ok:
             poses[int(marker_id)] = {
@@ -612,6 +627,202 @@ def draw_quality_score(frame, trans_ema, rot_ema, x, y):
     cv2.putText(frame, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA)
 
 
+def build_verification_graph_sample(world_from_camera, used_marker_ids, trans_mm, rot_deg, detected_poses):
+    sample = {
+        "x": np.nan,
+        "y": np.nan,
+        "z": np.nan,
+        "roll": np.nan,
+        "pitch": np.nan,
+        "yaw": np.nan,
+        "trans": np.nan if trans_mm is None else float(trans_mm),
+        "rot": np.nan if rot_deg is None else float(rot_deg),
+        "err": np.nan,
+        "markers": float(len(set(used_marker_ids))),
+    }
+
+    if world_from_camera is not None:
+        position = world_from_camera[:3, 3]
+        angles_deg = rotation_matrix_to_euler_deg(world_from_camera[:3, :3])
+        sample.update({
+            "x": float(position[0]),
+            "y": float(position[1]),
+            "z": float(position[2]),
+            "roll": float(angles_deg[0]),
+            "pitch": float(angles_deg[1]),
+            "yaw": float(angles_deg[2]),
+        })
+
+    visible_errors = [
+        float(pose["reprojection_error"])
+        for pose in detected_poses.values()
+        if np.isfinite(pose["reprojection_error"])
+    ]
+    if visible_errors:
+        sample["err"] = float(np.mean(visible_errors))
+
+    return sample
+
+
+def draw_graph_panel(canvas, history, rect, title, series, value_unit):
+    x0, y0, width, height = rect
+    cv2.rectangle(canvas, (x0, y0), (x0 + width, y0 + height), (36, 36, 36), -1)
+    cv2.rectangle(canvas, (x0, y0), (x0 + width, y0 + height), (80, 80, 80), 1)
+
+    plot_left = x0 + 70
+    plot_right = x0 + width - 18
+    plot_top = y0 + 34
+    plot_bottom = y0 + height - 34
+    plot_width = max(1, plot_right - plot_left)
+    plot_height = max(1, plot_bottom - plot_top)
+
+    for index in range(5):
+        gy = int(plot_top + index * plot_height / 4.0)
+        cv2.line(canvas, (plot_left, gy), (plot_right, gy), GRAPH_GRID_COLOR, 1)
+    for index in range(6):
+        gx = int(plot_left + index * plot_width / 5.0)
+        cv2.line(canvas, (gx, plot_top), (gx, plot_bottom), GRAPH_GRID_COLOR, 1)
+
+    cv2.putText(
+        canvas,
+        title,
+        (x0 + 12, y0 + 23),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        GRAPH_TEXT_COLOR,
+        1,
+        cv2.LINE_AA,
+    )
+
+    values = []
+    for item in history:
+        for key, _, _ in series:
+            value = item.get(key, np.nan)
+            if np.isfinite(value):
+                values.append(float(value))
+
+    if values:
+        low = float(np.min(values))
+        high = float(np.max(values))
+        if abs(high - low) < 1e-6:
+            margin = max(1.0, abs(high) * 0.05)
+            low -= margin
+            high += margin
+        else:
+            margin = (high - low) * 0.08
+            low -= margin
+            high += margin
+    else:
+        low, high = -1.0, 1.0
+
+    cv2.putText(
+        canvas,
+        f"{high:7.1f}{value_unit}",
+        (x0 + 6, plot_top + 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        GRAPH_TEXT_COLOR,
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        f"{low:7.1f}{value_unit}",
+        (x0 + 6, plot_bottom),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        GRAPH_TEXT_COLOR,
+        1,
+        cv2.LINE_AA,
+    )
+
+    count = len(history)
+    denom = max(1, GRAPH_HISTORY_FRAMES - 1)
+    for key, label, color in series:
+        previous = None
+        for index, item in enumerate(history):
+            value = item.get(key, np.nan)
+            if not np.isfinite(value):
+                previous = None
+                continue
+            px = int(plot_right - (count - 1 - index) * plot_width / denom)
+            normalized = (float(value) - low) / (high - low)
+            py = int(plot_bottom - np.clip(normalized, 0.0, 1.0) * plot_height)
+            point = (px, py)
+            if previous is not None:
+                cv2.line(canvas, previous, point, color, 2, cv2.LINE_AA)
+            previous = point
+
+        latest = history[-1].get(key, np.nan) if history else np.nan
+        text = f"{label}:{latest:7.1f}" if np.isfinite(latest) else f"{label}:   ---"
+        legend_x = x0 + 235 + series.index((key, label, color)) * 160
+        cv2.putText(
+            canvas,
+            text,
+            (legend_x, y0 + 23),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def draw_verification_graph(history):
+    canvas = np.full((GRAPH_HEIGHT, GRAPH_WIDTH, 3), GRAPH_BG_COLOR, dtype=np.uint8)
+    if not history:
+        return canvas
+
+    panels = [
+        (
+            (18, 18, GRAPH_WIDTH - 36, 205),
+            "World position, mm",
+            [
+                ("x", "X", (80, 220, 255)),
+                ("y", "Y", (80, 255, 120)),
+                ("z", "Z", (255, 180, 80)),
+            ],
+            "mm",
+        ),
+        (
+            (18, 242, GRAPH_WIDTH - 36, 205),
+            "World rotation, deg",
+            [
+                ("roll", "Roll", (255, 120, 120)),
+                ("pitch", "Pitch", (190, 140, 255)),
+                ("yaw", "Yaw", (120, 210, 255)),
+            ],
+            "deg",
+        ),
+        (
+            (18, 466, GRAPH_WIDTH - 36, 205),
+            "Consistency / artifacts",
+            [
+                ("trans", "Spread mm", (80, 220, 255)),
+                ("rot", "Spread deg", (255, 180, 80)),
+                ("err", "Err px", (255, 120, 120)),
+                ("markers", "Markers", (160, 255, 160)),
+            ],
+            "",
+        ),
+    ]
+
+    for rect, title, series, unit in panels:
+        draw_graph_panel(canvas, history, rect, title, series, unit)
+
+    cv2.putText(
+        canvas,
+        f"Last {len(history)} frames. Gaps mean pose was lost.",
+        (18, GRAPH_HEIGHT - 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        GRAPH_TEXT_COLOR,
+        1,
+        cv2.LINE_AA,
+    )
+    return canvas
+
+
 def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs, planar=False):
     marker_world_estimates = {
         BASE_MARKER_ID: {
@@ -727,7 +938,9 @@ def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs, planar=False)
 
 def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
     layout_payload, marker_world_transforms, marker_counts = load_marker_layout()
+    marker_length_mm = float(layout_payload.get("marker_length_mm", ARUCO_MARKER_LENGTH_MM))
     marker_error_ema = {}
+    graph_history = deque(maxlen=GRAPH_HISTORY_FRAMES)
     quality_trans_ema = None
     quality_rot_ema = None
     current_fps = 0.0
@@ -757,6 +970,7 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
             dictionary,
             camera_matrix,
             dist_coeffs,
+            marker_length_mm,
         )
 
         for mid, pose in detected_poses.items():
@@ -794,6 +1008,16 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
         else:
             last_status = "No known map markers in view."
 
+        graph_history.append(
+            build_verification_graph_sample(
+                world_from_camera,
+                used_marker_ids,
+                trans_mm,
+                rot_deg,
+                detected_poses,
+            )
+        )
+
         draw_quality_score(frame, quality_trans_ema, quality_rot_ema, 10, 360)
 
         draw_multiline_text(
@@ -822,6 +1046,7 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
         )
 
         cv2.imshow(WINDOW_TITLE, frame)
+        cv2.imshow(GRAPH_WINDOW_TITLE, draw_verification_graph(graph_history))
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break
