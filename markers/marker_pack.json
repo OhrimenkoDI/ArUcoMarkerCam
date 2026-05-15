@@ -1,0 +1,128 @@
+{
+  "dictionary_name": "DICT_APRILTAG_36h11",
+  "pixels_per_mm": 12.0,
+  "calibration_file": "camera_calibration.json",
+  "camera_calibration": {
+    "image_size": {
+      "width": 1280,
+      "height": 720
+    },
+    "rms": 0.45776374263618386,
+    "reprojection_error": 0.4577637041139201,
+    "camera_matrix": [
+      [
+        678.0017699741052,
+        0.0,
+        640.6334741251226
+      ],
+      [
+        0.0,
+        679.029134596658,
+        378.85654498408053
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "dist_coeffs": [
+      [
+        0.06662865437384466,
+        -0.08434415112036191,
+        -0.00012529746835614146,
+        0.0005251928061625506,
+        -0.03483403937984791
+      ]
+    ]
+  },
+  "charuco_board": {
+    "path": "markers\\charuco_board.png",
+    "board_size_px": [
+      3360,
+      2400
+    ],
+    "board_size_mm": [
+      280.0,
+      200.0
+    ],
+    "squares_x": 7,
+    "squares_y": 5,
+    "square_length_mm": 40.0,
+    "marker_length_mm": 30.0
+  },
+  "standalone_markers": [
+    {
+      "id": 0,
+      "size_mm": 180.0,
+      "size_px": 2160,
+      "path": "markers\\aruco_single\\aruco_id00_180mm.png"
+    },
+    {
+      "id": 1,
+      "size_mm": 180.0,
+      "size_px": 2160,
+      "path": "markers\\aruco_single\\aruco_id01_180mm.png"
+    },
+    {
+      "id": 2,
+      "size_mm": 180.0,
+      "size_px": 2160,
+      "path": "markers\\aruco_single\\aruco_id02_180mm.png"
+    },
+    {
+      "id": 3,
+      "size_mm": 180.0,
+      "size_px": 2160,
+      "path": "markers\\aruco_single\\aruco_id03_180mm.png"
+    },
+    {
+      "id": 4,
+      "size_mm": 180.0,
+      "size_px": 2160,
+      "path": "markers\\aruco_single\\aruco_id04_180mm.png"
+    },
+    {
+      "id": 5,
+      "size_mm": 180.0,
+      "size_px": 2160,
+      "path": "markers\\aruco_single\\aruco_id05_180mm.png"
+    },
+    {
+      "id": 6,
+      "size_mm": 180.0,
+      "size_px": 2160,
+      "path": "markers\\aruco_single\\aruco_id06_180mm.png"
+    },
+    {
+      "id": 7,
+      "size_mm": 180.0,
+      "size_px": 2160,
+      "path": "markers\\aruco_single\\aruco_id07_180mm.png"
+    },
+    {
+      "id": 8,
+      "size_mm": 180.0,
+      "size_px": 2160,
+      "path": "markers\\aruco_single\\aruco_id08_180mm.png"
+    },
+    {
+      "id": 9,
+      "size_mm": 180.0,
+      "size_px": 2160,
+      "path": "markers\\aruco_single\\aruco_id09_180mm.png"
+    }
+  ],
+  "detection_hints": {
+    "preferred_marker_family": "ChArUco for board pose, standalone ArUco for single-tag tracking",
+    "recommended_distances": {
+      "180mm": {
+        "approx_pixels_at_500mm": 244.08063719067786,
+        "approx_pixels_at_1000mm": 122.04031859533893,
+        "approx_pixels_at_2000mm": 61.020159297669466
+      }
+    },
+    "min_practical_marker_pixels": 40
+  },
+  "preview_image": "markers\\marker_pack_preview.png"
+}
