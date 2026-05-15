@@ -282,6 +282,7 @@ def main() -> None:
         # Состояние last_pose с временной меткой
         last_pose        = None
         last_pose_time   = -999.0
+        frozen_yaw_deg   = float(AZIMUTH_DEG)
 
         while True:
             t0 = time.perf_counter()
@@ -325,6 +326,7 @@ def main() -> None:
                     ema.update(x_m, y_m, z_m, yaw_adjusted)
                     last_pose      = ema.get()
                     last_pose_time = time.perf_counter()
+                    frozen_yaw_deg = last_pose[3]
                     reject_count   = 0
                 else:
                     reject_count += 1
@@ -347,9 +349,9 @@ def main() -> None:
                 else:
                     src = f"last({pose_age:.1f}s)"
             else:
-                # Нет свежей позы — отправляем только yaw-резерв, без позиции
+                # Нет свежей позы — позицию не доверяем, yaw замораживаем на последнем принятом.
                 x_f, y_f, z_f = 0.0, 0.0, 0.0
-                yaw_f = float(AZIMUTH_DEG)
+                yaw_f = frozen_yaw_deg
                 src   = "резерв"
 
             ap_x, ap_y, ap_z = pose_to_ardupilot(x_f, y_f, z_f)

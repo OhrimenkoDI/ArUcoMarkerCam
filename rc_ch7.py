@@ -178,6 +178,7 @@ def main() -> None:
         last_vision_frames = 0
         prev_yaw_deg = None
         last_pose = None  # последняя известная поза, если маркеры временно не видны
+        frozen_yaw_deg = float(AZIMUTH_DEG)
         while True:
             t0 = time.perf_counter()
 
@@ -188,9 +189,11 @@ def main() -> None:
                 last_pose = pose
             if last_pose is not None:
                 x_m, y_m, z_m, yaw_deg = last_pose
+                yaw_deg = (yaw_deg + CAMERA_AZIMUTH_OFFSET_DEG) % 360.0
+                frozen_yaw_deg = yaw_deg
             else:
-                x_m, y_m, z_m, yaw_deg = 0.0, 0.0, 0.0, float(AZIMUTH_DEG)
-            yaw_deg = (yaw_deg + CAMERA_AZIMUTH_OFFSET_DEG) % 360.0
+                x_m, y_m, z_m = 0.0, 0.0, 0.0
+                yaw_deg = frozen_yaw_deg
 
             yaw_step_deg = None
             if prev_yaw_deg is not None:
