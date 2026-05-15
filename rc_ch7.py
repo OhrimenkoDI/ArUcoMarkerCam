@@ -38,7 +38,7 @@ AZIMUTH_DEG = 0  # резервное значение, если маркеры 
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-CAMERA_AZIMUTH_OFFSET_DEG = 0.0  # camera yaw correction: final yaw = measured yaw + this constant
+CAMERA_AZIMUTH_OFFSET_DEG = 180.0  # camera yaw correction: final yaw = measured yaw + this constant
 
 
 def pose_to_ardupilot_position(x_m: float, y_m: float, z_m: float):
