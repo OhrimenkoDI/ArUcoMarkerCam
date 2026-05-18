@@ -2,6 +2,8 @@
 
 import json
 import os
+import socket
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
@@ -27,6 +29,9 @@ APRILTAG_DECIMATE = float(os.environ.get("ARUCO_APRILTAG_DECIMATE", "2.0"))
 MAX_REPROJECTION_ERROR_PX = float(os.environ.get("ARUCO_MAX_REPROJECTION_ERROR_PX", "3.0"))
 ROBUST_CANDIDATE_RESIDUAL_MM = float(os.environ.get("ARUCO_ROBUST_CANDIDATE_RESIDUAL_MM", "500.0"))
 DUAL_MARKER_MAX_SPREAD_MM = float(os.environ.get("ARUCO_DUAL_MARKER_MAX_SPREAD_MM", "250.0"))
+UDP_LOG_ENABLED = os.environ.get("ARUCO_UDP_LOG_ENABLED", "1").lower() not in ("0", "false", "no")
+UDP_LOG_HOST = os.environ.get("ARUCO_UDP_LOG_HOST", "10.0.20.195")
+UDP_LOG_PORT = int(os.environ.get("ARUCO_UDP_LOG_PORT", "15050"))
 LINUX_FALLBACK_SOURCES = ("/dev/video1", "/dev/video4", "/dev/video0")
 _LAST_CAPTURE_INFO = None
 _LAST_CAPTURE_ATTEMPTS = []
@@ -487,6 +492,25 @@ def _detect_and_estimate(
     marker_length_mm,
     marker_world_transforms,
 ):
+    result = _detect_and_estimate_with_diagnostics(
+        frame,
+        detector,
+        camera_matrix,
+        dist_coeffs,
+        marker_length_mm,
+        marker_world_transforms,
+    )
+    return result["world_from_camera"]
+
+
+def _detect_and_estimate_with_diagnostics(
+    frame,
+    detector,
+    camera_matrix,
+    dist_coeffs,
+    marker_length_mm,
+    marker_world_transforms,
+):
     _, _, detected_poses = _detect_marker_poses(
         frame,
         detector,
@@ -495,26 +519,46 @@ def _detect_and_estimate(
         marker_length_mm,
         include_reprojection_error=True,
     )
+    visible_marker_ids = sorted(int(marker_id) for marker_id in detected_poses)
     candidate_details = []
+    rejected_by_reprojection_error = []
     for marker_id, pose in detected_poses.items():
         if marker_id not in marker_world_transforms:
             continue
         if float(pose.get("reprojection_error", float("inf"))) > MAX_REPROJECTION_ERROR_PX:
+            rejected_by_reprojection_error.append(
+                {
+                    "marker_id": int(marker_id),
+                    "reprojection_error_px": float(pose.get("reprojection_error", float("inf"))),
+                }
+            )
             continue
+        world_from_camera = (
+            marker_world_transforms[marker_id]
+            @ _invert_transform(pose["camera_from_marker"])
+        )
         candidate_details.append(
             {
                 "marker_id": marker_id,
                 "reprojection_error": float(pose["reprojection_error"]),
-                "world_from_camera": (
-                    marker_world_transforms[marker_id]
-                    @ _invert_transform(pose["camera_from_marker"])
-                ),
+                "world_from_camera": world_from_camera,
             }
         )
 
     if not candidate_details:
-        return None
+        return {
+            "world_from_camera": None,
+            "visible_marker_ids": visible_marker_ids,
+            "used_marker_ids": [],
+            "rejected_by_reprojection_error": rejected_by_reprojection_error,
+            "rejected_by_residual": [],
+            "rejected_by_spread": [],
+            "consistency_mm": None,
+            "consistency_deg": None,
+            "per_marker": [],
+        }
 
+    rejected_by_residual = []
     if len(candidate_details) >= 3:
         positions = np.array(
             [detail["world_from_camera"][:3, 3] for detail in candidate_details],
@@ -527,26 +571,67 @@ def _detect_and_estimate(
             if float(np.linalg.norm(detail["world_from_camera"][:3, 3] - median_position))
             <= ROBUST_CANDIDATE_RESIDUAL_MM
         ]
+        rejected_by_residual = [
+            {
+                "marker_id": int(detail["marker_id"]),
+                "residual_mm": float(np.linalg.norm(detail["world_from_camera"][:3, 3] - median_position)),
+            }
+            for detail in candidate_details
+            if float(np.linalg.norm(detail["world_from_camera"][:3, 3] - median_position))
+            > ROBUST_CANDIDATE_RESIDUAL_MM
+        ]
         if filtered_details:
             candidate_details = filtered_details
         else:
             closest_index = int(np.argmin(np.linalg.norm(positions - median_position, axis=1)))
             candidate_details = [candidate_details[closest_index]]
 
+    rejected_by_spread = []
     if len(candidate_details) == 2:
         consistency_mm, _ = _compute_pose_consistency(
             [detail["world_from_camera"] for detail in candidate_details]
         )
         if consistency_mm is not None and consistency_mm > DUAL_MARKER_MAX_SPREAD_MM:
-            candidate_details = [
-                min(candidate_details, key=lambda detail: detail["reprojection_error"])
+            better = min(candidate_details, key=lambda detail: detail["reprojection_error"])
+            rejected_by_spread = [
+                {
+                    "marker_id": int(detail["marker_id"]),
+                    "spread_mm": float(consistency_mm),
+                }
+                for detail in candidate_details
+                if detail is not better
             ]
+            candidate_details = [better]
 
     world_from_camera_candidates = [
         detail["world_from_camera"]
         for detail in candidate_details
     ]
-    return _average_transforms(world_from_camera_candidates)
+    consistency_mm, consistency_deg = _compute_pose_consistency(world_from_camera_candidates)
+    world_from_camera = _average_transforms(world_from_camera_candidates)
+    per_marker = []
+    for detail in candidate_details:
+        candidate = detail["world_from_camera"]
+        residual_mm = float(np.linalg.norm(candidate[:3, 3] - world_from_camera[:3, 3]))
+        per_marker.append(
+            {
+                "marker_id": int(detail["marker_id"]),
+                "reprojection_error_px": float(detail["reprojection_error"]),
+                "candidate_xyz_mm": [float(v) for v in candidate[:3, 3]],
+                "candidate_minus_average_norm_mm": residual_mm,
+            }
+        )
+    return {
+        "world_from_camera": world_from_camera,
+        "visible_marker_ids": visible_marker_ids,
+        "used_marker_ids": [int(detail["marker_id"]) for detail in candidate_details],
+        "rejected_by_reprojection_error": rejected_by_reprojection_error,
+        "rejected_by_residual": rejected_by_residual,
+        "rejected_by_spread": rejected_by_spread,
+        "consistency_mm": consistency_mm,
+        "consistency_deg": consistency_deg,
+        "per_marker": per_marker,
+    }
 
 
 class ArucoPoseTracker:
@@ -568,6 +653,57 @@ class ArucoPoseTracker:
                 f"Cannot open camera source {CAMERA_SOURCE}; attempts={_LAST_CAPTURE_ATTEMPTS}"
             )
         self._capture_info = dict(_LAST_CAPTURE_INFO or {})
+        self._pose_sequence = 0
+        self._udp_log_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if UDP_LOG_ENABLED else None
+
+    def _send_udp_log(self, result, output_pose=None) -> None:
+        if self._udp_log_socket is None:
+            return
+        world_from_camera = result.get("world_from_camera")
+        pose_payload = None
+        if world_from_camera is not None:
+            xyz_mm = world_from_camera[:3, 3]
+            rpy_deg = _rotation_matrix_to_euler_deg(world_from_camera[:3, :3])
+            pose_payload = {
+                "xyz_mm": [float(v) for v in xyz_mm],
+                "rpy_deg": [float(v) for v in rpy_deg],
+            }
+        packet = {
+            "record_type": "aruco_pose",
+            "sequence": self._pose_sequence,
+            "wall_time_unix": time.time(),
+            "has_pose": world_from_camera is not None,
+            "pose": pose_payload,
+            "output_pose_m_yaw_deg": (
+                None
+                if output_pose is None
+                else {
+                    "x_m": float(output_pose[0]),
+                    "y_m": float(output_pose[1]),
+                    "z_m": float(output_pose[2]),
+                    "yaw_deg": float(output_pose[3]),
+                }
+            ),
+            "visible_marker_ids": result.get("visible_marker_ids", []),
+            "used_marker_ids": result.get("used_marker_ids", []),
+            "consistency_mm": result.get("consistency_mm"),
+            "consistency_deg": result.get("consistency_deg"),
+            "rejected_by_reprojection_error": result.get("rejected_by_reprojection_error", []),
+            "rejected_by_residual": result.get("rejected_by_residual", []),
+            "rejected_by_spread": result.get("rejected_by_spread", []),
+            "per_marker": result.get("per_marker", []),
+            "settings": {
+                "max_reprojection_error_px": MAX_REPROJECTION_ERROR_PX,
+                "robust_candidate_residual_mm": ROBUST_CANDIDATE_RESIDUAL_MM,
+                "dual_marker_max_spread_mm": DUAL_MARKER_MAX_SPREAD_MM,
+            },
+        }
+        self._pose_sequence += 1
+        try:
+            payload = json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            self._udp_log_socket.sendto(payload, (UDP_LOG_HOST, UDP_LOG_PORT))
+        except OSError:
+            pass
 
     def get_pose(self) -> Optional[Tuple[float, float, float, float]]:
         """Read one frame and return (x_m, y_m, z_m, yaw_deg) or None if no known markers visible."""
@@ -576,7 +712,7 @@ class ArucoPoseTracker:
             return None
 
         try:
-            world_from_camera = _detect_and_estimate(
+            result = _detect_and_estimate_with_diagnostics(
                 frame,
                 self._detector,
                 self._camera_matrix,
@@ -584,7 +720,9 @@ class ArucoPoseTracker:
                 self._marker_length_mm,
                 self._marker_world_transforms,
             )
+            world_from_camera = result["world_from_camera"]
             if world_from_camera is None:
+                self._send_udp_log(result)
                 return None
 
             xyz_mm = world_from_camera[:3, 3]
@@ -595,7 +733,9 @@ class ArucoPoseTracker:
             z_m = float(xyz_mm[2]) / 1000.0
             yaw_deg = -float(rpy_deg[2])
 
-            return x_m, y_m, z_m, yaw_deg
+            output_pose = (x_m, y_m, z_m, yaw_deg)
+            self._send_udp_log(result, output_pose)
+            return output_pose
         except Exception as exc:
             artifact_path = _save_frame_artifact(frame, "get_pose_error", self.get_capture_info())
             raise RuntimeError(f"ArUco frame processing failed; saved frame artifact: {artifact_path}") from exc
@@ -654,6 +794,9 @@ class ArucoPoseTracker:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+        if self._udp_log_socket is not None:
+            self._udp_log_socket.close()
+            self._udp_log_socket = None
 
     def __enter__(self):
         return self

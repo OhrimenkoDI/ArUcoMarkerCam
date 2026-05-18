@@ -1,4 +1,5 @@
 import json
+import socket
 import sys
 import time
 from collections import deque
@@ -28,6 +29,9 @@ BASE_MARKER_ID = 0
 LEARNING_MODE_3D = 1
 LEARNING_MODE_PLANAR = 2
 VERIFICATION_MODE = 3
+UDP_MONITOR_MODE = 4
+UDP_LOG_LISTEN_IP = "0.0.0.0"
+UDP_LOG_PORT = 15050
 
 FPS_UPDATE_PERIOD_SEC = 0.5
 TEXT_COLOR = (0, 255, 0)
@@ -319,6 +323,8 @@ def parse_mode_arg():
             return LEARNING_MODE_PLANAR
         if value in {"mode=3", "3", "--mode=3"}:
             return VERIFICATION_MODE
+        if value in {"mode=4", "4", "--mode=4"}:
+            return UDP_MONITOR_MODE
     return None
 
 
@@ -329,6 +335,7 @@ def select_mode_by_key():
         "Press 1  - learning mode (3D map)",
         "Press 2  - learning mode (planar floor map)",
         "Press 3  - verification mode",
+        "Press 4  - UDP pose monitor",
         f"Base marker id: {BASE_MARKER_ID}",
         "Esc - exit",
     ]
@@ -358,6 +365,9 @@ def select_mode_by_key():
         if key == ord("3"):
             cv2.destroyWindow(SELECTION_WINDOW_TITLE)
             return VERIFICATION_MODE
+        if key == ord("4"):
+            cv2.destroyWindow(SELECTION_WINDOW_TITLE)
+            return UDP_MONITOR_MODE
         if key == 27:
             cv2.destroyWindow(SELECTION_WINDOW_TITLE)
             return None
@@ -893,6 +903,46 @@ def build_verification_graph_sample(world_from_camera, used_marker_ids, trans_mm
     ]
     if visible_errors:
         sample["err"] = float(np.mean(visible_errors))
+
+    return sample
+
+
+def build_udp_graph_sample(packet):
+    sample = {
+        "x": np.nan,
+        "y": np.nan,
+        "z": np.nan,
+        "roll": np.nan,
+        "pitch": np.nan,
+        "yaw": np.nan,
+        "trans": np.nan if packet.get("consistency_mm") is None else float(packet["consistency_mm"]),
+        "rot": np.nan if packet.get("consistency_deg") is None else float(packet["consistency_deg"]),
+        "err": np.nan,
+        "markers": float(len(set(packet.get("used_marker_ids") or []))),
+    }
+
+    pose = packet.get("pose")
+    if pose is not None:
+        xyz = pose.get("xyz_mm") or [np.nan, np.nan, np.nan]
+        rpy = pose.get("rpy_deg") or [np.nan, np.nan, np.nan]
+        sample.update(
+            {
+                "x": float(xyz[0]),
+                "y": float(xyz[1]),
+                "z": float(xyz[2]),
+                "roll": float(rpy[0]),
+                "pitch": float(rpy[1]),
+                "yaw": float(rpy[2]),
+            }
+        )
+
+    errors = [
+        float(item["reprojection_error_px"])
+        for item in packet.get("per_marker", [])
+        if np.isfinite(float(item.get("reprojection_error_px", np.nan)))
+    ]
+    if errors:
+        sample["err"] = float(np.mean(errors))
 
     return sample
 
@@ -1487,9 +1537,74 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
     print(f"Mode 3 log saved: {log_path.resolve()}")
 
 
+def run_udp_monitor_mode():
+    graph_history = deque(maxlen=GRAPH_HISTORY_FRAMES)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((UDP_LOG_LISTEN_IP, UDP_LOG_PORT))
+    sock.settimeout(0.05)
+    packet_count = 0
+    bad_packet_count = 0
+    last_packet = None
+    last_packet_time = None
+    print(f"Mode 4 UDP monitor: listening on {UDP_LOG_LISTEN_IP}:{UDP_LOG_PORT}")
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(65535)
+        except socket.timeout:
+            pass
+        else:
+            try:
+                packet = json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                bad_packet_count += 1
+            else:
+                if packet.get("record_type") == "aruco_pose":
+                    packet_count += 1
+                    last_packet = packet
+                    last_packet_time = time.time()
+                    graph_history.append(build_udp_graph_sample(packet))
+                else:
+                    bad_packet_count += 1
+
+        canvas = draw_verification_graph(graph_history)
+        status_lines = [
+            f"Mode 4 UDP monitor  {UDP_LOG_LISTEN_IP}:{UDP_LOG_PORT}",
+            f"Packets: {packet_count}  bad: {bad_packet_count}",
+        ]
+        if last_packet is None:
+            status_lines.append("Waiting for aruco_pose UDP packets...")
+        else:
+            age = time.time() - last_packet_time if last_packet_time is not None else 0.0
+            status_lines.extend(
+                [
+                    f"Last age: {age:.2f}s  seq={last_packet.get('sequence')}",
+                    f"Used: {last_packet.get('used_marker_ids', [])}",
+                    f"Visible: {last_packet.get('visible_marker_ids', [])}",
+                    (
+                        f"Rejected: err={len(last_packet.get('rejected_by_reprojection_error', []))} "
+                        f"res={len(last_packet.get('rejected_by_residual', []))} "
+                        f"spread={len(last_packet.get('rejected_by_spread', []))}"
+                    ),
+                    "ESC - exit",
+                ]
+            )
+        draw_multiline_text(canvas, status_lines, 24, 42, GRAPH_TEXT_COLOR)
+        cv2.imshow(GRAPH_WINDOW_TITLE, canvas)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:
+            break
+
+    sock.close()
+
+
 def main():
     mode = choose_mode()
     if mode is None:
+        return
+
+    if mode == UDP_MONITOR_MODE:
+        run_udp_monitor_mode()
         return
 
     camera_matrix, dist_coeffs = load_calibration()
