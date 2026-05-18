@@ -53,73 +53,85 @@
   },
   "standalone_markers": [
     {
-      "id": 0,
-      "size_mm": 180.0,
-      "size_px": 2160,
-      "path": "markers\\aruco_single\\aruco_id00_180mm.png"
+      "id": 10,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id10_285mm.png"
     },
     {
-      "id": 1,
-      "size_mm": 180.0,
-      "size_px": 2160,
-      "path": "markers\\aruco_single\\aruco_id01_180mm.png"
+      "id": 11,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id11_285mm.png"
     },
     {
-      "id": 2,
-      "size_mm": 180.0,
-      "size_px": 2160,
-      "path": "markers\\aruco_single\\aruco_id02_180mm.png"
+      "id": 12,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id12_285mm.png"
     },
     {
-      "id": 3,
-      "size_mm": 180.0,
-      "size_px": 2160,
-      "path": "markers\\aruco_single\\aruco_id03_180mm.png"
+      "id": 13,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id13_285mm.png"
     },
     {
-      "id": 4,
-      "size_mm": 180.0,
-      "size_px": 2160,
-      "path": "markers\\aruco_single\\aruco_id04_180mm.png"
+      "id": 14,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id14_285mm.png"
     },
     {
-      "id": 5,
-      "size_mm": 180.0,
-      "size_px": 2160,
-      "path": "markers\\aruco_single\\aruco_id05_180mm.png"
+      "id": 15,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id15_285mm.png"
     },
     {
-      "id": 6,
-      "size_mm": 180.0,
-      "size_px": 2160,
-      "path": "markers\\aruco_single\\aruco_id06_180mm.png"
+      "id": 16,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id16_285mm.png"
     },
     {
-      "id": 7,
-      "size_mm": 180.0,
-      "size_px": 2160,
-      "path": "markers\\aruco_single\\aruco_id07_180mm.png"
+      "id": 17,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id17_285mm.png"
     },
     {
-      "id": 8,
-      "size_mm": 180.0,
-      "size_px": 2160,
-      "path": "markers\\aruco_single\\aruco_id08_180mm.png"
+      "id": 18,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id18_285mm.png"
     },
     {
-      "id": 9,
-      "size_mm": 180.0,
-      "size_px": 2160,
-      "path": "markers\\aruco_single\\aruco_id09_180mm.png"
+      "id": 19,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id19_285mm.png"
+    },
+    {
+      "id": 20,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id20_285mm.png"
+    },
+    {
+      "id": 21,
+      "size_mm": 285.0,
+      "size_px": 3420,
+      "path": "markers\\aruco_single\\aruco_id21_285mm.png"
     }
   ],
   "detection_hints": {
     "preferred_marker_family": "ChArUco for board pose, standalone ArUco for single-tag tracking",
     "recommended_distances": {
-      "180mm": {
-        "approx_pixels_at_500mm": 244.08063719067786,
-        "approx_pixels_at_1000mm": 122.04031859533893,
-        "approx_pixels_at_2000mm": 61.020159297669466
+      "285mm": {
+        "approx_pixels_at_500mm": 386.46100888523995,
+        "approx_pixels_at_1000mm": 193.23050444261997,
+        "approx_pixels_at_2000mm": 96.61525222130999
       }
     },
     "min_practical_marker_pixels": 40
