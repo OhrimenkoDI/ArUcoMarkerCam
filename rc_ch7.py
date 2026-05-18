@@ -39,11 +39,57 @@ AZIMUTH_DEG = 180  # резервное значение, если маркер�
 
 
 CAMERA_AZIMUTH_OFFSET_DEG = 180.0  # camera yaw correction: final yaw = measured yaw + this constant
+ALPHA_POS = 0.30
+ALPHA_YAW = 0.20
+MAX_POS_JUMP_M = 0.45
+MAX_YAW_JUMP_DEG = 10.0
+MAX_REJECTS_BEFORE_RESET = 10
+POSE_TIMEOUT_SEC = 1.0
 
 
 def pose_to_ardupilot_position(x_m: float, y_m: float, z_m: float):
     """Convert marker-map pose to ArduPilot local position: X forward, Y right, Z down."""
     return y_m, x_m, -z_m
+
+
+def angle_diff_deg(a: float, b: float) -> float:
+    return (a - b + 180.0) % 360.0 - 180.0
+
+
+class EMAFilter:
+    def __init__(self, alpha_pos: float = ALPHA_POS, alpha_yaw: float = ALPHA_YAW):
+        self._alpha_pos = alpha_pos
+        self._alpha_yaw = alpha_yaw
+        self._x = None
+        self._y = None
+        self._z = None
+        self._yaw = None
+
+    @property
+    def initialised(self) -> bool:
+        return self._x is not None
+
+    def update(self, x_m: float, y_m: float, z_m: float, yaw_deg: float):
+        if not self.initialised:
+            self._x, self._y, self._z, self._yaw = x_m, y_m, z_m, yaw_deg
+        else:
+            a = self._alpha_pos
+            self._x = a * x_m + (1.0 - a) * self._x
+            self._y = a * y_m + (1.0 - a) * self._y
+            self._z = a * z_m + (1.0 - a) * self._z
+            self._yaw = (self._yaw + self._alpha_yaw * angle_diff_deg(yaw_deg, self._yaw)) % 360.0
+        return self.get()
+
+    def get(self):
+        if not self.initialised:
+            return None
+        return self._x, self._y, self._z, self._yaw
+
+    def reset(self) -> None:
+        self._x = None
+        self._y = None
+        self._z = None
+        self._yaw = None
 
 
 class PoseWorker:
@@ -80,8 +126,7 @@ class PoseWorker:
             with self._lock:
                 self._frames += 1
                 self._visible = pose is not None
-                if pose is not None:
-                    self._pose = pose
+                self._pose = pose
 
 
 def make_connection() -> mavutil.mavfile:
@@ -176,8 +221,12 @@ def main() -> None:
         sent = 0
         last_rate_time = time.perf_counter()
         last_vision_frames = 0
+        ema = EMAFilter()
+        prev_raw_xy = None
         prev_yaw_deg = None
-        last_pose = None  # последняя известная поза, если маркеры временно не видны
+        reject_count = 0
+        last_pose = None
+        last_pose_time = -999.0
         frozen_yaw_deg = float(AZIMUTH_DEG)
         while True:
             t0 = time.perf_counter()
@@ -185,20 +234,62 @@ def main() -> None:
             pose, marker_visible, vision_frames, vision_error = pose_worker.snapshot()
             if vision_error is not None:
                 raise vision_error
+
             if pose is not None:
-                last_pose = pose
-            if last_pose is not None:
+                x_raw, y_raw, z_raw, yaw_raw = pose
+                yaw_adjusted = (yaw_raw + CAMERA_AZIMUTH_OFFSET_DEG) % 360.0
+
+                stale_pose = (time.perf_counter() - last_pose_time) >= POSE_TIMEOUT_SEC
+                if stale_pose:
+                    ema.reset()
+                    prev_raw_xy = None
+                    prev_yaw_deg = None
+                    reject_count = 0
+
+                pos_ok = True
+                if prev_raw_xy is not None:
+                    jump_m = math.hypot(x_raw - prev_raw_xy[0], y_raw - prev_raw_xy[1])
+                    if jump_m > MAX_POS_JUMP_M:
+                        pos_ok = False
+                        print(f"  [SKIP] pos jump {jump_m * 100:.1f} cm > {MAX_POS_JUMP_M * 100:.0f} cm")
+
+                yaw_ok = True
+                if prev_yaw_deg is not None:
+                    yaw_jump = abs(angle_diff_deg(yaw_adjusted, prev_yaw_deg))
+                    if yaw_jump > MAX_YAW_JUMP_DEG:
+                        yaw_ok = False
+                        print(f"  [SKIP] yaw jump {yaw_jump:.1f}deg > {MAX_YAW_JUMP_DEG:.0f}deg")
+
+                if pos_ok and yaw_ok:
+                    prev_raw_xy = (x_raw, y_raw)
+                    prev_yaw_deg = yaw_adjusted
+                    last_pose = ema.update(x_raw, y_raw, z_raw, yaw_adjusted)
+                    last_pose_time = time.perf_counter()
+                    frozen_yaw_deg = last_pose[3]
+                    reject_count = 0
+                else:
+                    reject_count += 1
+                    if reject_count >= MAX_REJECTS_BEFORE_RESET:
+                        print("  [RESET] too many rejected poses, accepting next measurement as new baseline")
+                        ema.reset()
+                        prev_raw_xy = None
+                        prev_yaw_deg = None
+                        last_pose = None
+                        last_pose_time = -999.0
+                        reject_count = 0
+
+            pose_age = time.perf_counter() - last_pose_time
+            if last_pose is not None and pose_age < POSE_TIMEOUT_SEC:
                 x_m, y_m, z_m, yaw_deg = last_pose
-                yaw_deg = (yaw_deg + CAMERA_AZIMUTH_OFFSET_DEG) % 360.0
-                frozen_yaw_deg = yaw_deg
+                src = "aruco" if marker_visible else f"last({pose_age:.1f}s)"
             else:
                 x_m, y_m, z_m = 0.0, 0.0, 0.0
                 yaw_deg = frozen_yaw_deg
+                src = "резерв"
 
             yaw_step_deg = None
             if prev_yaw_deg is not None:
-                yaw_step_deg = abs((yaw_deg - prev_yaw_deg + 180.0) % 360.0 - 180.0)
-            prev_yaw_deg = yaw_deg
+                yaw_step_deg = abs(angle_diff_deg(yaw_deg, prev_yaw_deg))
 
             ap_x_m, ap_y_m, ap_z_m = pose_to_ardupilot_position(x_m, y_m, z_m)
 
@@ -212,12 +303,6 @@ def main() -> None:
                 vision_hz = (vision_frames - last_vision_frames) / dt if dt > 0 else 0.0
                 last_rate_time = now
                 last_vision_frames = vision_frames
-                if marker_visible:
-                    src = "aruco"
-                elif last_pose is not None:
-                    src = "last"
-                else:
-                    src = "резерв"
                 step_info = ""
                 highlight_on = ""
                 highlight_off = ""

@@ -9,6 +9,7 @@ import numpy as np
 
 CALIBRATION_JSON_PATH = Path("camera_calibration.json")
 MARKER_LAYOUT_JSON_PATH = Path("marker_layout.json")
+VERIFICATION_LOG_DIR = Path("logs")
 
 CAMERA_SOURCE = 0
 CAMERA_BACKEND = "auto"
@@ -44,6 +45,14 @@ GRAPH_HEIGHT = 720
 GRAPH_BG_COLOR = (24, 24, 24)
 GRAPH_GRID_COLOR = (55, 55, 55)
 GRAPH_TEXT_COLOR = (225, 225, 225)
+ARTIFACT_JUMP_MM = 1000.0
+MAX_REPROJECTION_ERROR_PX = 3.0
+HARD_MAX_REPROJECTION_ERROR_PX = 5.0
+ROBUST_CANDIDATE_RESIDUAL_MM = 500.0
+SINGLE_MARKER_MAX_JUMP_MM = 500.0
+DUAL_MARKER_MAX_SPREAD_MM = 250.0
+EMA_EXCLUSION_THRESHOLD_PX = 6.0
+LONG_POSE_LOSS_FRAMES = 30
 
 # EMA smoothing factor for per-marker reprojection error and quality score
 EMA_ALPHA = 0.1
@@ -160,6 +169,30 @@ def rotation_matrix_to_euler_deg(rotation_matrix):
         yaw = 0.0
 
     return np.degrees([roll, pitch, yaw])
+
+
+def transform_to_log_pose(transform):
+    if transform is None:
+        return None
+    position = transform[:3, 3]
+    angles_deg = rotation_matrix_to_euler_deg(transform[:3, :3])
+    return {
+        "xyz_mm": [float(value) for value in position],
+        "rpy_deg": [float(value) for value in angles_deg],
+    }
+
+
+def vector_to_log(values):
+    return [float(value) for value in np.asarray(values, dtype=np.float64).reshape(-1)]
+
+
+def create_verification_log_file():
+    VERIFICATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    path = VERIFICATION_LOG_DIR / f"mode3_verification_{timestamp}.jsonl"
+    log_file = path.open("w", encoding="utf-8")
+    print(f"Mode 3 log: {path.resolve()}")
+    return path, log_file
 
 
 def rotation_matrix_to_quaternion(rotation_matrix):
@@ -446,49 +479,84 @@ def save_marker_layout(marker_world_estimates, planar=False):
     MARKER_LAYOUT_JSON_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def update_marker_world_estimates(marker_world_estimates, detected_poses, planar=False):
-    world_from_camera_candidates = []
-    for marker_id, pose in detected_poses.items():
-        if marker_id not in marker_world_estimates:
-            continue
-        world_from_marker = marker_world_estimates[marker_id]["transform"]
-        world_from_camera_candidates.append(
-            world_from_marker @ invert_transform(pose["camera_from_marker"])
+def update_marker_world_estimates(
+    marker_world_estimates,
+    detected_poses,
+    planar=False,
+    previous_world_from_camera=None,
+    marker_error_ema=None,
+    frames_since_previous_pose=None,
+):
+    marker_world_transforms = {
+        marker_id: data["transform"]
+        for marker_id, data in marker_world_estimates.items()
+    }
+    world_from_camera, used_marker_ids, (trans_mm, rot_deg), candidate_details, diagnostics = (
+        estimate_world_from_camera_robust(
+            marker_world_transforms,
+            detected_poses,
+            previous_world_from_camera,
+            marker_error_ema=marker_error_ema,
+            frames_since_previous_pose=frames_since_previous_pose,
         )
+    )
+    diagnostics["skipped_marker_updates"] = []
 
-    if not world_from_camera_candidates:
-        return None, [], (None, None)
+    if world_from_camera is None:
+        return None, [], (None, None), diagnostics
 
-    trans_mm, rot_deg = compute_pose_consistency(world_from_camera_candidates)
-    world_from_camera = average_transforms(world_from_camera_candidates)
-
-    # For map updates use world_from_camera derived only from the base marker —
-    # avoids circular bias where a wrong non-base marker poisons its own correction.
-    world_from_camera_trusted = None
-    if BASE_MARKER_ID in detected_poses and BASE_MARKER_ID in marker_world_estimates:
-        base_pose = detected_poses[BASE_MARKER_ID]
-        world_from_camera_trusted = (
-            marker_world_estimates[BASE_MARKER_ID]["transform"]
-            @ invert_transform(base_pose["camera_from_marker"])
-        )
-    if world_from_camera_trusted is None:
-        world_from_camera_trusted = world_from_camera
+    # Для обновления карты предпочитаем базовый маркер, если он прошел тот же
+    # робастный фильтр. Это уменьшает риск, что ошибочный небазовый маркер сам
+    # подтянет свою позицию в карте.
+    world_from_camera_trusted = world_from_camera
+    accepted_ids = set(diagnostics["accepted_marker_ids"])
+    if BASE_MARKER_ID in accepted_ids:
+        for detail in candidate_details:
+            if int(detail["marker_id"]) == BASE_MARKER_ID:
+                world_from_camera_trusted = detail["world_from_camera"]
+                break
 
     new_marker_ids = []
     for marker_id, pose in detected_poses.items():
+        reprojection_error = float(pose["reprojection_error"])
+        if reprojection_error > MAX_REPROJECTION_ERROR_PX:
+            diagnostics["skipped_marker_updates"].append(
+                {
+                    "marker_id": int(marker_id),
+                    "reason": "reprojection_error",
+                    "reprojection_error_px": reprojection_error,
+                }
+            )
+            continue
+
         estimated_world_from_marker = world_from_camera_trusted @ pose["camera_from_marker"]
         if planar:
             estimated_world_from_marker = planarize_transform(estimated_world_from_marker)
+
         if marker_id in marker_world_estimates:
             count = marker_world_estimates[marker_id]["count"]
-            marker_world_estimates[marker_id]["count"] = count + 1
             if marker_id != BASE_MARKER_ID:
                 old_transform = marker_world_estimates[marker_id]["transform"]
+                marker_jump_mm = float(
+                    np.linalg.norm(estimated_world_from_marker[:3, 3] - old_transform[:3, 3])
+                )
+                if marker_jump_mm > ROBUST_CANDIDATE_RESIDUAL_MM:
+                    diagnostics["skipped_marker_updates"].append(
+                        {
+                            "marker_id": int(marker_id),
+                            "reason": "map_position_jump",
+                            "jump_mm": marker_jump_mm,
+                        }
+                    )
+                    continue
+                marker_world_estimates[marker_id]["count"] = count + 1
                 alpha = max(0.02, 1.0 / (count + 1))
                 updated = blend_transforms(old_transform, estimated_world_from_marker, alpha)
                 if planar:
                     updated = planarize_transform(updated)
                 marker_world_estimates[marker_id]["transform"] = updated
+            else:
+                marker_world_estimates[marker_id]["count"] = count + 1
         else:
             marker_world_estimates[marker_id] = {
                 "transform": estimated_world_from_marker,
@@ -496,12 +564,13 @@ def update_marker_world_estimates(marker_world_estimates, detected_poses, planar
             }
             new_marker_ids.append(marker_id)
 
-    return world_from_camera, new_marker_ids, (trans_mm, rot_deg)
+    return world_from_camera, new_marker_ids, (trans_mm, rot_deg), diagnostics
 
 
-def estimate_world_from_camera(marker_world_transforms, detected_poses):
+def build_world_from_camera_candidates(marker_world_transforms, detected_poses):
     world_from_camera_candidates = []
     used_marker_ids = []
+    candidate_details = []
     for marker_id, pose in detected_poses.items():
         if marker_id not in marker_world_transforms:
             continue
@@ -509,6 +578,27 @@ def estimate_world_from_camera(marker_world_transforms, detected_poses):
         candidate = world_from_marker @ invert_transform(pose["camera_from_marker"])
         world_from_camera_candidates.append(candidate)
         used_marker_ids.append(marker_id)
+        candidate_details.append(
+            {
+                "marker_id": marker_id,
+                "world_from_camera": candidate,
+                "world_from_marker": world_from_marker,
+                "camera_from_marker": pose["camera_from_marker"],
+                "rvec": pose["rvec"],
+                "tvec": pose["tvec"],
+                "reprojection_error": pose["reprojection_error"],
+                "corners": pose["corners"],
+            }
+        )
+
+    return world_from_camera_candidates, used_marker_ids, candidate_details
+
+
+def estimate_world_from_camera(marker_world_transforms, detected_poses):
+    world_from_camera_candidates, used_marker_ids, _ = build_world_from_camera_candidates(
+        marker_world_transforms,
+        detected_poses,
+    )
 
     if not world_from_camera_candidates:
         return None, [], (None, None)
@@ -516,6 +606,157 @@ def estimate_world_from_camera(marker_world_transforms, detected_poses):
     trans_mm, rot_deg = compute_pose_consistency(world_from_camera_candidates)
     world_from_camera = average_transforms(world_from_camera_candidates)
     return world_from_camera, used_marker_ids, (trans_mm, rot_deg)
+
+
+def estimate_world_from_camera_with_diagnostics(marker_world_transforms, detected_poses):
+    world_from_camera_candidates, used_marker_ids, candidate_details = build_world_from_camera_candidates(
+        marker_world_transforms,
+        detected_poses,
+    )
+
+    if not world_from_camera_candidates:
+        return None, [], (None, None), []
+
+    trans_mm, rot_deg = compute_pose_consistency(world_from_camera_candidates)
+    world_from_camera = average_transforms(world_from_camera_candidates)
+    return world_from_camera, used_marker_ids, (trans_mm, rot_deg), candidate_details
+
+
+def estimate_world_from_camera_robust(
+    marker_world_transforms,
+    detected_poses,
+    previous_world_from_camera=None,
+    marker_error_ema=None,
+    frames_since_previous_pose=None,
+):
+    ema_excluded_ids = []
+    if marker_error_ema:
+        clean_poses = {}
+        for mid, pose in detected_poses.items():
+            if marker_error_ema.get(mid, 0.0) > EMA_EXCLUSION_THRESHOLD_PX:
+                ema_excluded_ids.append(int(mid))
+            else:
+                clean_poses[mid] = pose
+        detected_poses = clean_poses
+
+    _, _, all_candidate_details = build_world_from_camera_candidates(
+        marker_world_transforms,
+        detected_poses,
+    )
+
+    quality_candidates = [
+        detail
+        for detail in all_candidate_details
+        if float(detail["reprojection_error"]) <= MAX_REPROJECTION_ERROR_PX
+    ]
+    hard_rejected_ids = [
+        int(detail["marker_id"])
+        for detail in all_candidate_details
+        if float(detail["reprojection_error"]) > HARD_MAX_REPROJECTION_ERROR_PX
+    ]
+    soft_rejected_ids = [
+        int(detail["marker_id"])
+        for detail in all_candidate_details
+        if MAX_REPROJECTION_ERROR_PX < float(detail["reprojection_error"]) <= HARD_MAX_REPROJECTION_ERROR_PX
+    ]
+
+    def _diag(**overrides):
+        base = {
+            "input_candidate_count": len(all_candidate_details),
+            "accepted_marker_ids": [],
+            "ema_excluded_marker_ids": ema_excluded_ids,
+            "soft_rejected_by_reprojection_error": soft_rejected_ids,
+            "hard_rejected_by_reprojection_error": hard_rejected_ids,
+            "rejected_by_residual": [],
+            "rejected_by_spread": [],
+            "rejected_single_marker_jump": [],
+            "effective_jump_limit_mm": None,
+            "reason": "ok",
+        }
+        base.update(overrides)
+        return base
+
+    if not quality_candidates:
+        return None, [], (None, None), all_candidate_details, _diag(reason="no_quality_candidates")
+
+    rejected_by_residual = []
+    accepted_details = quality_candidates
+    if len(quality_candidates) >= 3:
+        candidate_positions = np.array(
+            [detail["world_from_camera"][:3, 3] for detail in quality_candidates],
+            dtype=np.float64,
+        )
+        median_position = np.median(candidate_positions, axis=0)
+        filtered_details = []
+        for detail in quality_candidates:
+            residual = float(
+                np.linalg.norm(detail["world_from_camera"][:3, 3] - median_position)
+            )
+            if residual <= ROBUST_CANDIDATE_RESIDUAL_MM:
+                filtered_details.append(detail)
+            else:
+                rejected_by_residual.append(
+                    {
+                        "marker_id": int(detail["marker_id"]),
+                        "residual_mm": residual,
+                    }
+                )
+        if filtered_details:
+            accepted_details = filtered_details
+        else:
+            closest_index = int(np.argmin(np.linalg.norm(candidate_positions - median_position, axis=1)))
+            accepted_details = [quality_candidates[closest_index]]
+
+    rejected_by_spread = []
+    if len(accepted_details) == 2:
+        t_spread, _ = compute_pose_consistency(
+            [d["world_from_camera"] for d in accepted_details]
+        )
+        if t_spread is not None and t_spread > DUAL_MARKER_MAX_SPREAD_MM:
+            better = min(accepted_details, key=lambda d: float(d["reprojection_error"]))
+            worse = next(d for d in accepted_details if d is not better)
+            rejected_by_spread.append({
+                "marker_id": int(worse["marker_id"]),
+                "spread_mm": float(t_spread),
+            })
+            accepted_details = [better]
+
+    rejected_single_marker_jump = []
+    effective_jump_limit = None
+    if len(accepted_details) <= 2 and previous_world_from_camera is not None:
+        avg_candidate = average_transforms([d["world_from_camera"] for d in accepted_details])
+        jump_xy = float(np.linalg.norm(
+            avg_candidate[:3, 3][:2] - previous_world_from_camera[:3, 3][:2]
+        ))
+        long_loss = (
+            frames_since_previous_pose is not None
+            and frames_since_previous_pose > LONG_POSE_LOSS_FRAMES
+        )
+        effective_jump_limit = SINGLE_MARKER_MAX_JUMP_MM * (4.0 if long_loss else 1.0)
+        if jump_xy > effective_jump_limit:
+            for d in accepted_details:
+                rejected_single_marker_jump.append({
+                    "marker_id": int(d["marker_id"]),
+                    "jump_xy_mm": jump_xy,
+                })
+            return None, [], (None, None), all_candidate_details, _diag(
+                rejected_by_residual=rejected_by_residual,
+                rejected_by_spread=rejected_by_spread,
+                rejected_single_marker_jump=rejected_single_marker_jump,
+                effective_jump_limit_mm=effective_jump_limit,
+                reason="single_marker_jump",
+            )
+
+    accepted_transforms = [detail["world_from_camera"] for detail in accepted_details]
+    trans_mm, rot_deg = compute_pose_consistency(accepted_transforms)
+    world_from_camera = average_transforms(accepted_transforms)
+    used_marker_ids = [int(detail["marker_id"]) for detail in accepted_details]
+    return world_from_camera, used_marker_ids, (trans_mm, rot_deg), all_candidate_details, _diag(
+        accepted_marker_ids=used_marker_ids,
+        rejected_by_residual=rejected_by_residual,
+        rejected_by_spread=rejected_by_spread,
+        effective_jump_limit_mm=effective_jump_limit,
+    )
 
 
 def draw_marker_visuals(
@@ -654,6 +895,112 @@ def build_verification_graph_sample(world_from_camera, used_marker_ids, trans_mm
         sample["err"] = float(np.mean(visible_errors))
 
     return sample
+
+
+def build_verification_log_record(
+    frame_index,
+    timestamp_sec,
+    current_fps,
+    layout_mode,
+    marker_ids,
+    detected_poses,
+    marker_error_ema,
+    world_from_camera,
+    previous_world_from_camera,
+    used_marker_ids,
+    trans_mm,
+    rot_deg,
+    candidate_details,
+    robust_diagnostics,
+    previous_pose_frame,
+):
+    visible_marker_ids = []
+    if marker_ids is not None:
+        visible_marker_ids = [int(value) for value in marker_ids.flatten()]
+
+    solved_marker_ids = sorted(int(value) for value in detected_poses)
+    used_marker_set = {int(value) for value in used_marker_ids}
+    unused_solved_ids = [value for value in solved_marker_ids if value not in used_marker_set]
+
+    world_pose = transform_to_log_pose(world_from_camera)
+    previous_delta = None
+    artifact_flags = []
+    frames_since_previous_pose = None
+    if previous_pose_frame is not None:
+        frames_since_previous_pose = int(frame_index - previous_pose_frame)
+    if world_from_camera is not None and previous_world_from_camera is not None:
+        delta_xyz = world_from_camera[:3, 3] - previous_world_from_camera[:3, 3]
+        delta_xy = float(np.linalg.norm(delta_xyz[:2]))
+        delta_xyz_norm = float(np.linalg.norm(delta_xyz))
+        previous_delta = {
+            "dxyz_mm": [float(value) for value in delta_xyz],
+            "dxy_mm": delta_xy,
+            "dxyz_norm_mm": delta_xyz_norm,
+        }
+        if delta_xy > ARTIFACT_JUMP_MM:
+            artifact_flags.append("world_xy_jump_gt_1000mm")
+
+    per_marker = []
+    for detail in candidate_details:
+        marker_id = int(detail["marker_id"])
+        candidate = detail["world_from_camera"]
+        candidate_pose = transform_to_log_pose(candidate)
+        residual_xyz = None
+        residual_norm = None
+        if world_from_camera is not None:
+            residual = candidate[:3, 3] - world_from_camera[:3, 3]
+            residual_xyz = [float(value) for value in residual]
+            residual_norm = float(np.linalg.norm(residual))
+
+        corners_px = np.asarray(detail["corners"], dtype=np.float64).reshape(4, 2)
+        per_marker.append(
+            {
+                "id": marker_id,
+                "reprojection_error_px": float(detail["reprojection_error"]),
+                "reprojection_error_ema_px": (
+                    float(marker_error_ema[marker_id])
+                    if marker_id in marker_error_ema
+                    else None
+                ),
+                "camera_from_marker": transform_to_log_pose(detail["camera_from_marker"]),
+                "world_from_marker_map": transform_to_log_pose(detail["world_from_marker"]),
+                "world_from_camera_candidate": candidate_pose,
+                "candidate_minus_average_xyz_mm": residual_xyz,
+                "candidate_minus_average_norm_mm": residual_norm,
+                "solvepnp_rvec": vector_to_log(detail["rvec"]),
+                "solvepnp_tvec_mm": vector_to_log(detail["tvec"]),
+                "corners_px": [[float(x), float(y)] for x, y in corners_px],
+            }
+        )
+
+    return {
+        "record_type": "frame",
+        "frame": int(frame_index),
+        "time_sec": float(timestamp_sec),
+        "wall_time_unix": float(time.time()),
+        "fps": float(current_fps),
+        "layout_mode": layout_mode,
+        "artifact_flags": artifact_flags,
+        "visible_marker_ids": visible_marker_ids,
+        "solved_marker_ids": solved_marker_ids,
+        "used_marker_ids": sorted(used_marker_set),
+        "unused_solved_marker_ids": unused_solved_ids,
+        "world_from_camera": world_pose,
+        "previous_pose_frame": previous_pose_frame,
+        "frames_since_previous_pose": frames_since_previous_pose,
+        "delta_from_previous_world_pose": previous_delta,
+        "candidate_consistency": {
+            "translation_spread_mm": None if trans_mm is None else float(trans_mm),
+            "rotation_spread_deg": None if rot_deg is None else float(rot_deg),
+        },
+        "robust_filter": robust_diagnostics,
+        "mean_reprojection_error_px": (
+            None
+            if not detected_poses
+            else float(np.mean([pose["reprojection_error"] for pose in detected_poses.values()]))
+        ),
+        "per_marker": per_marker,
+    }
 
 
 def draw_graph_panel(canvas, history, rect, title, series, value_unit):
@@ -830,6 +1177,10 @@ def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs, planar=False)
     current_fps = 0.0
     fps_frame_count = 0
     fps_started_at = time.perf_counter()
+    previous_world_from_camera = None
+    previous_pose_frame = None
+    frame_index = 0
+    filter_status = "Filter: waiting for measurements"
 
     while True:
         ok, frame = cap.read()
@@ -862,10 +1213,16 @@ def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs, planar=False)
             camera_matrix, dist_coeffs, marker_counts, marker_error_ema,
         )
 
-        world_from_camera, new_marker_ids, (trans_mm, rot_deg) = update_marker_world_estimates(
+        frames_since_previous_pose = (
+            int(frame_index - previous_pose_frame) if previous_pose_frame is not None else None
+        )
+        world_from_camera, new_marker_ids, (trans_mm, rot_deg), diagnostics = update_marker_world_estimates(
             marker_world_estimates,
             detected_poses,
             planar=planar,
+            previous_world_from_camera=previous_world_from_camera,
+            marker_error_ema=marker_error_ema,
+            frames_since_previous_pose=frames_since_previous_pose,
         )
 
         if trans_mm is not None:
@@ -879,9 +1236,27 @@ def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs, planar=False)
         if new_marker_ids:
             last_status = f"Learned markers: {', '.join(str(v) for v in sorted(new_marker_ids))}"
         elif world_from_camera is None:
-            last_status = f"Need marker {BASE_MARKER_ID} or another already learned marker in view."
+            if diagnostics["reason"] == "single_marker_jump":
+                last_status = "Rejected single-marker jump; keep 2+ known markers in view."
+            elif diagnostics["reason"] == "no_quality_candidates":
+                last_status = f"Need marker {BASE_MARKER_ID} or another good learned marker in view."
+            else:
+                last_status = f"Need marker {BASE_MARKER_ID} or another already learned marker in view."
+
+        rejected_reproj = (
+            len(diagnostics["soft_rejected_by_reprojection_error"])
+            + len(diagnostics["hard_rejected_by_reprojection_error"])
+        )
+        rejected_residual = len(diagnostics["rejected_by_residual"])
+        rejected_updates = len(diagnostics["skipped_marker_updates"])
+        filter_status = (
+            f"Filter: accepted={diagnostics['accepted_marker_ids']} "
+            f"rej_err={rejected_reproj} rej_res={rejected_residual} rej_upd={rejected_updates}"
+        )
 
         if world_from_camera is not None:
+            previous_world_from_camera = np.array(world_from_camera, dtype=np.float64, copy=True)
+            previous_pose_frame = frame_index
             draw_world_pose_text(
                 frame,
                 "Camera pose from learned markers",
@@ -899,6 +1274,7 @@ def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs, planar=False)
                 f"Mode: {mode_name}",
                 f"Known markers: {', '.join(str(v) for v in sorted(marker_world_estimates))}",
                 f"Status: {last_status}",
+                filter_status,
                 "Planar floor constraints: ON" if planar else "Planar floor constraints: OFF",
                 "S - save marker_layout.json",
                 "ESC - exit",
@@ -918,6 +1294,7 @@ def run_learning_mode(cap, dictionary, camera_matrix, dist_coeffs, planar=False)
             cv2.LINE_AA,
         )
 
+        frame_index += 1
         cv2.imshow(WINDOW_TITLE, frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("s"):
@@ -940,7 +1317,40 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
     fps_started_at = time.perf_counter()
     last_status = f"Loaded {len(marker_world_transforms)} markers from {MARKER_LAYOUT_JSON_PATH.name}"
     layout_mode = layout_payload.get("layout_mode", "3d")
+    log_path, log_file = create_verification_log_file()
+    frame_index = 0
+    previous_world_from_camera = None
+    previous_pose_frame = None
     print(last_status)
+    log_file.write(
+        json.dumps(
+            {
+                "record_type": "session",
+                "wall_time_unix": float(time.time()),
+                "calibration_path": str(CALIBRATION_JSON_PATH),
+                "marker_layout_path": str(MARKER_LAYOUT_JSON_PATH),
+                "layout_mode": layout_mode,
+                "map_marker_ids": sorted(int(value) for value in marker_world_transforms),
+                "marker_length_mm": marker_length_mm,
+                "dictionary_name": layout_payload.get("dictionary_name", DICTIONARY_NAME),
+                "camera_source": CAMERA_SOURCE,
+                "camera_backend": CAMERA_BACKEND,
+                "target_width": TARGET_WIDTH,
+                "target_height": TARGET_HEIGHT,
+                "target_fps": TARGET_FPS,
+                "artifact_jump_mm": ARTIFACT_JUMP_MM,
+                "max_reprojection_error_px": MAX_REPROJECTION_ERROR_PX,
+                "hard_max_reprojection_error_px": HARD_MAX_REPROJECTION_ERROR_PX,
+                "robust_candidate_residual_mm": ROBUST_CANDIDATE_RESIDUAL_MM,
+                "single_marker_max_jump_mm": SINGLE_MARKER_MAX_JUMP_MM,
+                "dual_marker_max_spread_mm": DUAL_MARKER_MAX_SPREAD_MM,
+                "ema_exclusion_threshold_px": EMA_EXCLUSION_THRESHOLD_PX,
+                "long_pose_loss_frames": LONG_POSE_LOSS_FRAMES,
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
 
     while True:
         ok, frame = cap.read()
@@ -972,9 +1382,15 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
             camera_matrix, dist_coeffs, marker_counts, marker_error_ema,
         )
 
-        world_from_camera, used_marker_ids, (trans_mm, rot_deg) = estimate_world_from_camera(
+        frames_since_previous_pose = (
+            int(frame_index - previous_pose_frame) if previous_pose_frame is not None else None
+        )
+        world_from_camera, used_marker_ids, (trans_mm, rot_deg), candidate_details, robust_diagnostics = estimate_world_from_camera_robust(
             marker_world_transforms,
             detected_poses,
+            previous_world_from_camera,
+            marker_error_ema=marker_error_ema,
+            frames_since_previous_pose=frames_since_previous_pose,
         )
 
         if trans_mm is not None:
@@ -1008,6 +1424,31 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
             )
         )
 
+        log_record = build_verification_log_record(
+            frame_index,
+            now,
+            current_fps,
+            layout_mode,
+            marker_ids,
+            detected_poses,
+            marker_error_ema,
+            world_from_camera,
+            previous_world_from_camera,
+            used_marker_ids,
+            trans_mm,
+            rot_deg,
+            candidate_details,
+            robust_diagnostics,
+            previous_pose_frame,
+        )
+        log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+        if frame_index % 30 == 0 or log_record["artifact_flags"]:
+            log_file.flush()
+        if world_from_camera is not None:
+            previous_world_from_camera = np.array(world_from_camera, dtype=np.float64, copy=True)
+            previous_pose_frame = frame_index
+        frame_index += 1
+
         draw_quality_score(frame, quality_trans_ema, quality_rot_ema, 10, 360)
 
         draw_multiline_text(
@@ -1018,6 +1459,7 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
                 f"Status: {last_status}",
                 f"Base marker: {layout_payload['base_marker_id']}",
                 f"Layout mode: {layout_mode}",
+                f"Log: {log_path.name}",
                 "ESC - exit",
             ],
             10,
@@ -1040,6 +1482,9 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break
+
+    log_file.close()
+    print(f"Mode 3 log saved: {log_path.resolve()}")
 
 
 def main():

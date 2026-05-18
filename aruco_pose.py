@@ -24,6 +24,9 @@ TARGET_FOURCC = os.environ.get("ARUCO_CAMERA_FOURCC", "MJPG")
 PROCESS_SCALE = float(os.environ.get("ARUCO_PROCESS_SCALE", "0.5"))
 FAST_DETECTOR = os.environ.get("ARUCO_FAST_DETECTOR", "1").lower() not in ("0", "false", "no")
 APRILTAG_DECIMATE = float(os.environ.get("ARUCO_APRILTAG_DECIMATE", "2.0"))
+MAX_REPROJECTION_ERROR_PX = float(os.environ.get("ARUCO_MAX_REPROJECTION_ERROR_PX", "3.0"))
+ROBUST_CANDIDATE_RESIDUAL_MM = float(os.environ.get("ARUCO_ROBUST_CANDIDATE_RESIDUAL_MM", "500.0"))
+DUAL_MARKER_MAX_SPREAD_MM = float(os.environ.get("ARUCO_DUAL_MARKER_MAX_SPREAD_MM", "250.0"))
 LINUX_FALLBACK_SOURCES = ("/dev/video1", "/dev/video4", "/dev/video0")
 _LAST_CAPTURE_INFO = None
 _LAST_CAPTURE_ATTEMPTS = []
@@ -490,19 +493,59 @@ def _detect_and_estimate(
         camera_matrix,
         dist_coeffs,
         marker_length_mm,
-        include_reprojection_error=False,
+        include_reprojection_error=True,
     )
-    world_from_camera_candidates = []
+    candidate_details = []
     for marker_id, pose in detected_poses.items():
         if marker_id not in marker_world_transforms:
             continue
-        world_from_camera_candidates.append(
-            marker_world_transforms[marker_id] @ _invert_transform(pose["camera_from_marker"])
+        if float(pose.get("reprojection_error", float("inf"))) > MAX_REPROJECTION_ERROR_PX:
+            continue
+        candidate_details.append(
+            {
+                "marker_id": marker_id,
+                "reprojection_error": float(pose["reprojection_error"]),
+                "world_from_camera": (
+                    marker_world_transforms[marker_id]
+                    @ _invert_transform(pose["camera_from_marker"])
+                ),
+            }
         )
 
-    if not world_from_camera_candidates:
+    if not candidate_details:
         return None
 
+    if len(candidate_details) >= 3:
+        positions = np.array(
+            [detail["world_from_camera"][:3, 3] for detail in candidate_details],
+            dtype=np.float64,
+        )
+        median_position = np.median(positions, axis=0)
+        filtered_details = [
+            detail
+            for detail in candidate_details
+            if float(np.linalg.norm(detail["world_from_camera"][:3, 3] - median_position))
+            <= ROBUST_CANDIDATE_RESIDUAL_MM
+        ]
+        if filtered_details:
+            candidate_details = filtered_details
+        else:
+            closest_index = int(np.argmin(np.linalg.norm(positions - median_position, axis=1)))
+            candidate_details = [candidate_details[closest_index]]
+
+    if len(candidate_details) == 2:
+        consistency_mm, _ = _compute_pose_consistency(
+            [detail["world_from_camera"] for detail in candidate_details]
+        )
+        if consistency_mm is not None and consistency_mm > DUAL_MARKER_MAX_SPREAD_MM:
+            candidate_details = [
+                min(candidate_details, key=lambda detail: detail["reprojection_error"])
+            ]
+
+    world_from_camera_candidates = [
+        detail["world_from_camera"]
+        for detail in candidate_details
+    ]
     return _average_transforms(world_from_camera_candidates)
 
 
