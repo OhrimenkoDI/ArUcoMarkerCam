@@ -461,8 +461,6 @@ def update_marker_world_estimates(marker_world_estimates, detected_poses, planar
 
     trans_mm, rot_deg = compute_pose_consistency(world_from_camera_candidates)
     world_from_camera = average_transforms(world_from_camera_candidates)
-    if planar and world_from_camera is not None:
-        world_from_camera = planarize_transform(world_from_camera)
 
     # For map updates use world_from_camera derived only from the base marker —
     # avoids circular bias where a wrong non-base marker poisons its own correction.
@@ -473,8 +471,6 @@ def update_marker_world_estimates(marker_world_estimates, detected_poses, planar
             marker_world_estimates[BASE_MARKER_ID]["transform"]
             @ invert_transform(base_pose["camera_from_marker"])
         )
-        if planar:
-            world_from_camera_trusted = planarize_transform(world_from_camera_trusted)
     if world_from_camera_trusted is None:
         world_from_camera_trusted = world_from_camera
 
@@ -503,7 +499,7 @@ def update_marker_world_estimates(marker_world_estimates, detected_poses, planar
     return world_from_camera, new_marker_ids, (trans_mm, rot_deg)
 
 
-def estimate_world_from_camera(marker_world_transforms, detected_poses, planar=False):
+def estimate_world_from_camera(marker_world_transforms, detected_poses):
     world_from_camera_candidates = []
     used_marker_ids = []
     for marker_id, pose in detected_poses.items():
@@ -511,8 +507,6 @@ def estimate_world_from_camera(marker_world_transforms, detected_poses, planar=F
             continue
         world_from_marker = marker_world_transforms[marker_id]
         candidate = world_from_marker @ invert_transform(pose["camera_from_marker"])
-        if planar:
-            candidate = planarize_transform(candidate)
         world_from_camera_candidates.append(candidate)
         used_marker_ids.append(marker_id)
 
@@ -521,8 +515,6 @@ def estimate_world_from_camera(marker_world_transforms, detected_poses, planar=F
 
     trans_mm, rot_deg = compute_pose_consistency(world_from_camera_candidates)
     world_from_camera = average_transforms(world_from_camera_candidates)
-    if planar and world_from_camera is not None:
-        world_from_camera = planarize_transform(world_from_camera)
     return world_from_camera, used_marker_ids, (trans_mm, rot_deg)
 
 
@@ -948,7 +940,6 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
     fps_started_at = time.perf_counter()
     last_status = f"Loaded {len(marker_world_transforms)} markers from {MARKER_LAYOUT_JSON_PATH.name}"
     layout_mode = layout_payload.get("layout_mode", "3d")
-    planar = layout_mode == "planar"
     print(last_status)
 
     while True:
@@ -984,7 +975,6 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
         world_from_camera, used_marker_ids, (trans_mm, rot_deg) = estimate_world_from_camera(
             marker_world_transforms,
             detected_poses,
-            planar=planar,
         )
 
         if trans_mm is not None:
