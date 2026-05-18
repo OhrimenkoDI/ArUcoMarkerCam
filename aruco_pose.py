@@ -32,6 +32,9 @@ DUAL_MARKER_MAX_SPREAD_MM = float(os.environ.get("ARUCO_DUAL_MARKER_MAX_SPREAD_M
 UDP_LOG_ENABLED = os.environ.get("ARUCO_UDP_LOG_ENABLED", "1").lower() not in ("0", "false", "no")
 UDP_LOG_HOST = os.environ.get("ARUCO_UDP_LOG_HOST", "10.0.20.195")
 UDP_LOG_PORT = int(os.environ.get("ARUCO_UDP_LOG_PORT", "15050"))
+TEMPORAL_MAX_JUMP_MM = float(os.environ.get("ARUCO_TEMPORAL_MAX_JUMP_MM", "500.0"))
+LONG_POSE_LOSS_FRAMES = int(os.environ.get("ARUCO_LONG_POSE_LOSS_FRAMES", "30"))
+RECOVERY_MIN_MARKERS = int(os.environ.get("ARUCO_RECOVERY_MIN_MARKERS", "2"))
 LINUX_FALLBACK_SOURCES = ("/dev/video1", "/dev/video4", "/dev/video0")
 _LAST_CAPTURE_INFO = None
 _LAST_CAPTURE_ATTEMPTS = []
@@ -655,8 +658,55 @@ class ArucoPoseTracker:
         self._capture_info = dict(_LAST_CAPTURE_INFO or {})
         self._pose_sequence = 0
         self._udp_log_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if UDP_LOG_ENABLED else None
+        self._last_accepted_world_from_camera = None
+        self._last_accepted_sequence = None
 
-    def _send_udp_log(self, result, output_pose=None) -> None:
+    def _apply_temporal_gate(self, result) -> Tuple[bool, str, list]:
+        world_from_camera = result.get("world_from_camera")
+        if world_from_camera is None:
+            return False, "no_pose", []
+
+        used_marker_ids = result.get("used_marker_ids", [])
+        frames_since_accepted = None
+        if self._last_accepted_sequence is not None:
+            frames_since_accepted = self._pose_sequence - self._last_accepted_sequence
+
+        long_loss = (
+            frames_since_accepted is not None
+            and frames_since_accepted > LONG_POSE_LOSS_FRAMES
+        )
+        if len(used_marker_ids) < RECOVERY_MIN_MARKERS:
+            rejected = [
+                {
+                    "reason": "insufficient_markers",
+                    "used_marker_count": len(used_marker_ids),
+                    "required_marker_count": RECOVERY_MIN_MARKERS,
+                    "frames_since_accepted": frames_since_accepted,
+                    "long_pose_loss": long_loss,
+                }
+            ]
+            return False, "insufficient_markers", rejected
+
+        if self._last_accepted_world_from_camera is not None:
+            jump_xy_mm = float(np.linalg.norm(
+                world_from_camera[:3, 3][:2]
+                - self._last_accepted_world_from_camera[:3, 3][:2]
+            ))
+            if jump_xy_mm > TEMPORAL_MAX_JUMP_MM:
+                rejected = [
+                    {
+                        "reason": "temporal_xy_jump",
+                        "jump_xy_mm": jump_xy_mm,
+                        "max_jump_mm": TEMPORAL_MAX_JUMP_MM,
+                        "frames_since_accepted": frames_since_accepted,
+                        "used_marker_ids": used_marker_ids,
+                    }
+                ]
+                return False, "temporal_xy_jump", rejected
+
+        return True, "ok", []
+
+    def _send_udp_log(self, result, output_pose=None, temporal_status="not_checked", rejected_by_temporal=None) -> None:
         if self._udp_log_socket is None:
             return
         world_from_camera = result.get("world_from_camera")
@@ -691,11 +741,16 @@ class ArucoPoseTracker:
             "rejected_by_reprojection_error": result.get("rejected_by_reprojection_error", []),
             "rejected_by_residual": result.get("rejected_by_residual", []),
             "rejected_by_spread": result.get("rejected_by_spread", []),
+            "rejected_by_temporal": rejected_by_temporal or [],
+            "temporal_status": temporal_status,
             "per_marker": result.get("per_marker", []),
             "settings": {
                 "max_reprojection_error_px": MAX_REPROJECTION_ERROR_PX,
                 "robust_candidate_residual_mm": ROBUST_CANDIDATE_RESIDUAL_MM,
                 "dual_marker_max_spread_mm": DUAL_MARKER_MAX_SPREAD_MM,
+                "temporal_max_jump_mm": TEMPORAL_MAX_JUMP_MM,
+                "long_pose_loss_frames": LONG_POSE_LOSS_FRAMES,
+                "recovery_min_markers": RECOVERY_MIN_MARKERS,
             },
         }
         self._pose_sequence += 1
@@ -722,7 +777,18 @@ class ArucoPoseTracker:
             )
             world_from_camera = result["world_from_camera"]
             if world_from_camera is None:
-                self._send_udp_log(result)
+                self._send_udp_log(result, temporal_status="no_pose")
+                return None
+
+            accepted, temporal_status, rejected_by_temporal = self._apply_temporal_gate(result)
+            if not accepted:
+                filtered_result = dict(result)
+                filtered_result["world_from_camera"] = None
+                self._send_udp_log(
+                    filtered_result,
+                    temporal_status=temporal_status,
+                    rejected_by_temporal=rejected_by_temporal,
+                )
                 return None
 
             xyz_mm = world_from_camera[:3, 3]
@@ -734,7 +800,9 @@ class ArucoPoseTracker:
             yaw_deg = -float(rpy_deg[2])
 
             output_pose = (x_m, y_m, z_m, yaw_deg)
-            self._send_udp_log(result, output_pose)
+            self._last_accepted_world_from_camera = np.array(world_from_camera, dtype=np.float64, copy=True)
+            self._last_accepted_sequence = self._pose_sequence
+            self._send_udp_log(result, output_pose, temporal_status=temporal_status)
             return output_pose
         except Exception as exc:
             artifact_path = _save_frame_artifact(frame, "get_pose_error", self.get_capture_info())

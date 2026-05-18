@@ -199,6 +199,15 @@ def create_verification_log_file():
     return path, log_file
 
 
+def create_udp_monitor_log_file():
+    VERIFICATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    path = VERIFICATION_LOG_DIR / f"mode4_udp_pose_{timestamp}.jsonl"
+    log_file = path.open("w", encoding="utf-8")
+    print(f"Mode 4 UDP log: {path.resolve()}")
+    return path, log_file
+
+
 def rotation_matrix_to_quaternion(rotation_matrix):
     matrix = np.asarray(rotation_matrix, dtype=np.float64)
     trace = np.trace(matrix)
@@ -1396,6 +1405,7 @@ def run_verification_mode(cap, dictionary, camera_matrix, dist_coeffs):
                 "dual_marker_max_spread_mm": DUAL_MARKER_MAX_SPREAD_MM,
                 "ema_exclusion_threshold_px": EMA_EXCLUSION_THRESHOLD_PX,
                 "long_pose_loss_frames": LONG_POSE_LOSS_FRAMES,
+                "recovery_min_markers": 2,
             },
             ensure_ascii=False,
         )
@@ -1542,6 +1552,21 @@ def run_udp_monitor_mode():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_LOG_LISTEN_IP, UDP_LOG_PORT))
     sock.settimeout(0.05)
+    log_path, log_file = create_udp_monitor_log_file()
+    log_file.write(
+        json.dumps(
+            {
+                "record_type": "session",
+                "wall_time_unix": float(time.time()),
+                "mode": "udp_pose_monitor",
+                "listen_ip": UDP_LOG_LISTEN_IP,
+                "listen_port": UDP_LOG_PORT,
+                "graph_history_frames": GRAPH_HISTORY_FRAMES,
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
     packet_count = 0
     bad_packet_count = 0
     last_packet = None
@@ -1564,6 +1589,12 @@ def run_udp_monitor_mode():
                     last_packet = packet
                     last_packet_time = time.time()
                     graph_history.append(build_udp_graph_sample(packet))
+                    log_record = dict(packet)
+                    log_record["receiver_wall_time_unix"] = float(last_packet_time)
+                    log_record["sender_addr"] = [addr[0], int(addr[1])]
+                    log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+                    if packet_count % 30 == 0:
+                        log_file.flush()
                 else:
                     bad_packet_count += 1
 
@@ -1579,13 +1610,16 @@ def run_udp_monitor_mode():
             status_lines.extend(
                 [
                     f"Last age: {age:.2f}s  seq={last_packet.get('sequence')}",
+                    f"Log: {log_path.name}",
                     f"Used: {last_packet.get('used_marker_ids', [])}",
                     f"Visible: {last_packet.get('visible_marker_ids', [])}",
                     (
                         f"Rejected: err={len(last_packet.get('rejected_by_reprojection_error', []))} "
                         f"res={len(last_packet.get('rejected_by_residual', []))} "
-                        f"spread={len(last_packet.get('rejected_by_spread', []))}"
+                        f"spread={len(last_packet.get('rejected_by_spread', []))} "
+                        f"temporal={len(last_packet.get('rejected_by_temporal', []))}"
                     ),
+                    f"Temporal: {last_packet.get('temporal_status', '---')}",
                     "ESC - exit",
                 ]
             )
@@ -1595,6 +1629,8 @@ def run_udp_monitor_mode():
         if key == 27:
             break
 
+    log_file.close()
+    print(f"Mode 4 UDP log saved: {log_path.resolve()}")
     sock.close()
 
 
