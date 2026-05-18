@@ -17,7 +17,7 @@ CALIBRATION_JSON_PATH = SCRIPT_DIR / "camera_calibration.json"
 MARKER_LAYOUT_JSON_PATH = SCRIPT_DIR / "marker_layout.json"
 ARTIFACTS_DIR = SCRIPT_DIR / "artifacts"
 
-CAMERA_SOURCE = os.environ.get("ARUCO_CAMERA_SOURCE", "0")
+CAMERA_SOURCE = os.environ.get("ARUCO_CAMERA_SOURCE", "rtsp://127.0.0.1:8554/mystreamUSB")
 CAMERA_BACKEND = os.environ.get("ARUCO_CAMERA_BACKEND", "auto").lower()
 TARGET_WIDTH = int(os.environ.get("ARUCO_CAMERA_WIDTH", "1280"))
 TARGET_HEIGHT = int(os.environ.get("ARUCO_CAMERA_HEIGHT", "720"))
@@ -35,7 +35,7 @@ UDP_LOG_PORT = int(os.environ.get("ARUCO_UDP_LOG_PORT", "15050"))
 TEMPORAL_MAX_JUMP_MM = float(os.environ.get("ARUCO_TEMPORAL_MAX_JUMP_MM", "500.0"))
 LONG_POSE_LOSS_FRAMES = int(os.environ.get("ARUCO_LONG_POSE_LOSS_FRAMES", "30"))
 RECOVERY_MIN_MARKERS = int(os.environ.get("ARUCO_RECOVERY_MIN_MARKERS", "2"))
-LINUX_FALLBACK_SOURCES = ("rtsp://10.0.20.152:8554/mystreamUSB")#,"/dev/video1", "/dev/video4", "/dev/video0")
+LINUX_FALLBACK_SOURCES = ("/dev/video1", "/dev/video4", "/dev/video0")
 _LAST_CAPTURE_INFO = None
 _LAST_CAPTURE_ATTEMPTS = []
 
@@ -134,8 +134,21 @@ def _build_gstreamer_pipeline(source) -> Optional[str]:
     )
 
 
+def _is_network_stream(source) -> bool:
+    return isinstance(source, str) and source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
+
+
 def _camera_attempts(source):
     normalized_source = _normalize_camera_source(source)
+    if _is_network_stream(normalized_source):
+        ffmpeg_backend = getattr(cv2, "CAP_FFMPEG", cv2.CAP_ANY)
+        if CAMERA_BACKEND == "auto":
+            return [
+                (normalized_source, ffmpeg_backend),
+                (normalized_source, cv2.CAP_ANY),
+            ]
+        return [(normalized_source, _BACKEND_MAP.get(CAMERA_BACKEND, ffmpeg_backend))]
+
     if os.name == "nt":
         if CAMERA_BACKEND != "auto":
             return [(normalized_source, _BACKEND_MAP.get(CAMERA_BACKEND, cv2.CAP_ANY))]
@@ -176,6 +189,8 @@ def _camera_attempts(source):
 
 def _configure_camera(cap: cv2.VideoCapture) -> None:
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if _is_network_stream(CAMERA_SOURCE):
+        return
     if TARGET_FOURCC:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*TARGET_FOURCC))
     if TARGET_WIDTH > 0:
