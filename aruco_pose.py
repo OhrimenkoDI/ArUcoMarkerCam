@@ -35,7 +35,7 @@ UDP_LOG_PORT = int(os.environ.get("ARUCO_UDP_LOG_PORT", "15050"))
 TEMPORAL_MAX_JUMP_MM = float(os.environ.get("ARUCO_TEMPORAL_MAX_JUMP_MM", "500.0"))
 LONG_POSE_LOSS_FRAMES = int(os.environ.get("ARUCO_LONG_POSE_LOSS_FRAMES", "30"))
 RECOVERY_MIN_MARKERS = int(os.environ.get("ARUCO_RECOVERY_MIN_MARKERS", "2"))
-LINUX_FALLBACK_SOURCES = ("/dev/video1", "/dev/video4", "/dev/video0")
+LINUX_FALLBACK_SOURCES = ("rtsp://10.0.20.152:8554/mystreamUSB")#,"/dev/video1", "/dev/video4", "/dev/video0")
 _LAST_CAPTURE_INFO = None
 _LAST_CAPTURE_ATTEMPTS = []
 
